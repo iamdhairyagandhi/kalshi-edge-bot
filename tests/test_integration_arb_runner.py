@@ -79,10 +79,10 @@ async def test_full_scan_pass_executes_qualifying_arb(mock_kalshi):
         assert summary["opportunities"] >= 1
         # KXARB-1 should be executed; KXTHIN-1 rejected on volume
         assert summary["executed"] == 1
-        assert "KXARB-1:YES" in executor.portfolio.positions
-        assert "KXARB-1:NO" in executor.portfolio.positions
+        assert "kalshi:KXARB-1:YES" in executor.portfolio.positions
+        assert "kalshi:KXARB-1:NO" in executor.portfolio.positions
         # KXNOARB has no opportunity
-        assert "KXNOARB-1:YES" not in executor.portfolio.positions
+        assert "kalshi:KXNOARB-1:YES" not in executor.portfolio.positions
 
         await client.close()
 
@@ -103,6 +103,6 @@ async def test_gates_block_arb_on_low_volume(mock_kalshi):
         summary = await run_once(client, executor, max_markets=10)
 
         # KXTHIN-1 position should NOT exist
-        assert "KXTHIN-1:YES" not in executor.portfolio.positions
+        assert "kalshi:KXTHIN-1:YES" not in executor.portfolio.positions
 
         await client.close()

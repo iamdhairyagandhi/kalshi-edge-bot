@@ -62,5 +62,38 @@ class Settings:
     db_path: str = field(default_factory=lambda: _env("DB_PATH", "data/bot.db"))
     log_dir: str = field(default_factory=lambda: _env("LOG_DIR", "logs"))
 
+    # ------------------------------------------------------------------
+    # Polymarket (read-only in v1; live execution deferred to a later phase)
+    # ------------------------------------------------------------------
+    polymarket_gamma_url: str = field(
+        default_factory=lambda: _env("POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com")
+    )
+    polymarket_data_url: str = field(
+        default_factory=lambda: _env("POLYMARKET_DATA_URL", "https://data-api.polymarket.com")
+    )
+    polymarket_clob_url: str = field(
+        default_factory=lambda: _env("POLYMARKET_CLOB_URL", "https://clob.polymarket.com")
+    )
+    polymarket_leaderboard_url: str = field(
+        default_factory=lambda: _env("POLYMARKET_LEADERBOARD_URL", "https://lb-api.polymarket.com")
+    )
+    polymarket_chain_id: int = field(default_factory=lambda: _env_int("POLYMARKET_CHAIN_ID", 137))
+
+    # Optional offline replay: if set, the Polymarket client serves all
+    # responses from JSON fixtures under this directory and never hits the
+    # network. Used heavily in tests + corp networks that block egress.
+    polymarket_replay_dir: Optional[str] = field(
+        default_factory=lambda: _env("POLYMARKET_REPLAY_DIR")
+    )
+
+    # Smart-money consensus tunables
+    polymarket_top_n: int = field(default_factory=lambda: _env_int("POLYMARKET_TOP_N", 10))
+    polymarket_consensus_k: int = field(default_factory=lambda: _env_int("POLYMARKET_CONSENSUS_K", 5))
+    polymarket_lookback_hours: int = field(default_factory=lambda: _env_int("POLYMARKET_LOOKBACK_HOURS", 24))
+    polymarket_min_wallet_trades: int = field(default_factory=lambda: _env_int("POLYMARKET_MIN_WALLET_TRADES", 50))
+    polymarket_min_wallet_resolved: int = field(default_factory=lambda: _env_int("POLYMARKET_MIN_WALLET_RESOLVED", 20))
+    polymarket_max_slippage_cents: float = field(default_factory=lambda: _env_float("POLYMARKET_MAX_SLIPPAGE_CENTS", 0.02))
+    polymarket_gas_usd: float = field(default_factory=lambda: _env_float("POLYMARKET_GAS_USD", 0.05))
+
 
 settings = Settings()
