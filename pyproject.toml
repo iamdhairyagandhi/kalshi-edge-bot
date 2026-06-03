@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kalshi-edge-bot"
+version = "0.1.0"
+description = "Deterministic, fee-aware Kalshi trading bot focused on structural edge."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+readme = "README.md"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

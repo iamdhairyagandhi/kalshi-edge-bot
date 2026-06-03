@@ -1,0 +1,24 @@
+# Generic secrets
+.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.hypothesis/
+*.egg-info/
+build/
+dist/
+
+# Data
+data/
+logs/
+*.db
+*.sqlite
+
+# IDE
+.vscode/
+.idea/
