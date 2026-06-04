@@ -19,7 +19,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from dashboard_v2.api.routes import (
-    cohort, markets, portfolio, positions, signals,
+    calibration, cohort, killswitch, markets, portfolio, positions, signals,
 )
 from dashboard_v2.api.stream import StreamHub, start_pollers
 
@@ -84,6 +84,8 @@ app.include_router(positions.router, prefix="/api", tags=["positions"])
 app.include_router(signals.router, prefix="/api", tags=["signals"])
 app.include_router(cohort.router, prefix="/api", tags=["cohort"])
 app.include_router(markets.router, prefix="/api", tags=["markets"])
+app.include_router(calibration.router, prefix="/api", tags=["calibration"])
+app.include_router(killswitch.router, prefix="/api", tags=["killswitch"])
 
 
 @app.get("/api/health")

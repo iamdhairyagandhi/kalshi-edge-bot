@@ -211,19 +211,54 @@ table.tight tr:hover td { background: var(--bg-3); }
 /* ============ Grid layout ============ */
 .dash-grid {
   display: grid;
-  grid-template-columns: 2fr 2fr 1.4fr;
-  grid-template-rows: 200px 1fr 1fr;
+  grid-template-columns: 1.5fr 1.5fr 1.3fr 1.2fr;
+  grid-template-rows: 220px 1fr 1fr 220px;
   gap: 8px;
   padding: 8px;
   height: calc(100vh - 48px);
 }
-.cell-equity    { grid-column: 1 / span 2; grid-row: 1; }
+.cell-equity    { grid-column: 1 / span 2; grid-row: 1 / span 2; }
 .cell-cohort    { grid-column: 3;          grid-row: 1 / span 2; }
-.cell-positions { grid-column: 1;          grid-row: 2; }
-.cell-signals   { grid-column: 2;          grid-row: 2; }
-.cell-fills     { grid-column: 1;          grid-row: 3; }
-.cell-latency   { grid-column: 2;          grid-row: 3; }
-.cell-portfolio { grid-column: 3;          grid-row: 3; }
+.cell-book      { grid-column: 4;          grid-row: 1 / span 2; }
+.cell-positions { grid-column: 1 / span 2; grid-row: 3; }
+.cell-signals   { grid-column: 3 / span 2; grid-row: 3; }
+.cell-fills     { grid-column: 1 / span 2; grid-row: 4; }
+.cell-latency   { grid-column: 3;          grid-row: 4; }
+.cell-brier     { grid-column: 4;          grid-row: 4; }
+.cell-kill      { grid-column: 1;          grid-row: 1; display: none; } /* slots merged into equity row visually */
+.cell-portfolio { grid-column: 1;          grid-row: 1; display: none; }
+
+/* Tablet — collapse to 3 cols */
+@media (max-width: 1500px) {
+  .dash-grid { grid-template-columns: 1fr 1fr 1fr; grid-template-rows: repeat(5, minmax(180px, 1fr)); }
+  .cell-equity    { grid-column: 1 / span 3; grid-row: 1; }
+  .cell-cohort    { grid-column: 1;          grid-row: 2; }
+  .cell-book      { grid-column: 2;          grid-row: 2; }
+  .cell-brier     { grid-column: 3;          grid-row: 2; display: block; }
+  .cell-positions { grid-column: 1 / span 2; grid-row: 3; }
+  .cell-signals   { grid-column: 3;          grid-row: 3; }
+  .cell-fills     { grid-column: 1 / span 2; grid-row: 4; }
+  .cell-latency   { grid-column: 3;          grid-row: 4; }
+  .cell-kill      { grid-column: 1 / span 2; grid-row: 5; display: block; }
+  .cell-portfolio { grid-column: 3;          grid-row: 5; display: block; }
+}
+
+/* Wide layout reveals kill + portfolio in a bottom strip */
+@media (min-width: 1501px) {
+  .dash-grid {
+    grid-template-rows: 220px 220px 1fr 200px;
+  }
+  .cell-kill      { grid-column: 3 / span 2; grid-row: 4; display: block; }
+  .cell-portfolio { grid-column: 1 / span 2; grid-row: 4; display: block; }
+  .cell-fills     { grid-column: 1 / span 2; grid-row: 3; }
+  .cell-latency   { grid-column: 3;          grid-row: 3; }
+  .cell-brier     { grid-column: 4;          grid-row: 3; }
+  .cell-signals   { grid-column: 3 / span 2; grid-row: 2; }
+  .cell-positions { grid-column: 1 / span 2; grid-row: 2; }
+  .cell-equity    { grid-column: 1 / span 2; grid-row: 1; }
+  .cell-cohort    { grid-column: 3;          grid-row: 1; }
+  .cell-book      { grid-column: 4;          grid-row: 1; }
+}
 
 /* ============ Misc ============ */
 .kpi-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; }

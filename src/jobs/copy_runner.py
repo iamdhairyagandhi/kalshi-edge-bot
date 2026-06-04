@@ -83,6 +83,24 @@ CREATE INDEX IF NOT EXISTS idx_consensus_signals_decision
     ON polymarket_consensus_signals(decision);
 CREATE INDEX IF NOT EXISTS idx_consensus_signals_market
     ON polymarket_consensus_signals(condition_id);
+
+CREATE TABLE IF NOT EXISTS polymarket_cohort_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_unix INTEGER NOT NULL,
+    cohort_version TEXT NOT NULL,
+    wallet TEXT NOT NULL,
+    rank INTEGER NOT NULL,
+    score REAL NOT NULL,
+    realized_pnl_usd REAL NOT NULL,
+    n_trades INTEGER NOT NULL,
+    n_resolved INTEGER NOT NULL,
+    last_trade_unix INTEGER NOT NULL,
+    pnl_stability REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cohort_snap_version
+    ON polymarket_cohort_snapshots(cohort_version);
+CREATE INDEX IF NOT EXISTS idx_cohort_snap_unix
+    ON polymarket_cohort_snapshots(snapshot_unix DESC);
 """
 
 
@@ -167,6 +185,34 @@ def _record_signal_decision(
         )
 
 
+def _record_cohort_snapshot(
+    db_path: str,
+    cohort_version: str,
+    scores: List[WalletScore],
+) -> None:
+    """Persist the ranked cohort for the dashboard. Idempotent per version."""
+    snapshot_unix = int(time.time())
+    with _conn(db_path) as c:
+        # Only insert if this exact version hasn't been seen.
+        existing = c.execute(
+            "SELECT 1 FROM polymarket_cohort_snapshots WHERE cohort_version = ? LIMIT 1",
+            (cohort_version,),
+        ).fetchone()
+        if existing:
+            return
+        for i, s in enumerate(scores):
+            c.execute(
+                """INSERT INTO polymarket_cohort_snapshots(
+                    snapshot_unix, cohort_version, wallet, rank, score,
+                    realized_pnl_usd, n_trades, n_resolved, last_trade_unix,
+                    pnl_stability)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (snapshot_unix, cohort_version, s.wallet, i + 1, s.score,
+                 s.realized_pnl_usd, s.n_trades, s.n_resolved,
+                 s.last_trade_unix, s.pnl_stability),
+            )
+
+
 def _isoformat_now() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
@@ -242,6 +288,13 @@ def run_once(
     cohort_scores: List[WalletScore] = select_cohort(ranked, top_n=top_n)
     cohort_wallets = [s.wallet for s in cohort_scores]
     ver = cohort_version(cohort_wallets) if cohort_wallets else "empty"
+
+    # Persist cohort snapshot so the dashboard can show true smart-money rankings.
+    if cohort_scores:
+        try:
+            _record_cohort_snapshot(db_path, ver, cohort_scores)
+        except sqlite3.Error as e:
+            log.warning("cohort snapshot write failed: %s", e)
 
     # 3. Detect consensus signals
     if len(cohort_wallets) < consensus_k:

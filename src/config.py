@@ -60,6 +60,7 @@ class Settings:
 
     # Data paths
     db_path: str = field(default_factory=lambda: _env("DB_PATH", "data/bot.db"))
+    calibration_db_path: str = field(default_factory=lambda: _env("CALIBRATION_DB_PATH", "data/calibration.db"))
     log_dir: str = field(default_factory=lambda: _env("LOG_DIR", "logs"))
 
     # ------------------------------------------------------------------

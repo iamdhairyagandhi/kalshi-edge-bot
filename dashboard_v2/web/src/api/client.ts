@@ -12,6 +12,27 @@ export type Portfolio = {
   n_open_polymarket: number;
 };
 
+export type Brier = { strategy: string; n_resolved: number; brier_score: number };
+
+export type StrategyState = {
+  strategy: string;
+  enabled: boolean;
+  last_brier: number | null;
+  last_n_samples: number | null;
+  last_evaluated_at: string | null;
+  disabled_reason: string | null;
+};
+
+export type BookLevel = { price: number; size: number };
+export type Orderbook = {
+  condition_id: string;
+  outcome_index: number;
+  outcome_label: string;
+  token_id: string;
+  bids: BookLevel[];
+  asks: BookLevel[];
+};
+
 export type EquityPoint = { timestamp_unix: number; equity: number; venue?: string | null };
 
 export type Position = {
@@ -55,6 +76,16 @@ async function getJSON<T>(path: string): Promise<T> {
   return r.json();
 }
 
+async function postJSON<T>(path: string, body: unknown): Promise<T> {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`${path} → ${r.status}`);
+  return r.json();
+}
+
 export const api = {
   portfolio: (venue?: string) => getJSON<Portfolio>(`/api/portfolio${venue ? `?venue=${venue}` : ""}`),
   equity:    (venue?: string) => getJSON<EquityPoint[]>(`/api/equity${venue ? `?venue=${venue}` : ""}`),
@@ -63,6 +94,12 @@ export const api = {
   signals:   () => getJSON<Signal[]>("/api/signals?limit=200"),
   cohort:    () => getJSON<CohortWallet[]>("/api/cohort"),
   latency:   () => getJSON<LatencyBucket[]>("/api/latency"),
+  brier:     () => getJSON<Brier[]>("/api/calibration"),
+  killswitch:() => getJSON<StrategyState[]>("/api/killswitch"),
+  toggleKill:(strategy: string, enabled: boolean, reason?: string) =>
+              postJSON<StrategyState>("/api/killswitch", { strategy, enabled, reason }),
+  book:      (conditionId: string, outcomeIndex = 0) =>
+              getJSON<Orderbook>(`/api/markets/polymarket/${conditionId}/book?outcome_index=${outcomeIndex}`),
   health:    () => getJSON<{ ok: boolean }>("/api/health"),
 };
 

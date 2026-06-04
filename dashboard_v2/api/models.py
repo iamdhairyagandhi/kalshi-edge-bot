@@ -101,6 +101,29 @@ class BrierReport(BaseModel):
     brier_score: float
 
 
+class StrategyState(BaseModel):
+    strategy: str
+    enabled: bool
+    last_brier: Optional[float] = None
+    last_n_samples: Optional[int] = None
+    last_evaluated_at: Optional[str] = None
+    disabled_reason: Optional[str] = None
+
+
+class OrderbookLevel(BaseModel):
+    price: float
+    size: float
+
+
+class OrderbookSnapshot(BaseModel):
+    condition_id: str
+    outcome_index: int
+    outcome_label: str
+    token_id: str
+    bids: List[OrderbookLevel]
+    asks: List[OrderbookLevel]
+
+
 class KillSwitch(BaseModel):
     active: bool
     reason: Optional[str]
