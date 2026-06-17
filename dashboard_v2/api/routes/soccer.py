@@ -142,6 +142,36 @@ class CalibrationOut(BaseModel):
     reliability: List[Dict[str, float]]
 
 
+class RecordPredictionIn(BaseModel):
+    """Body for POST /api/soccer/predictions — let the user log a bet
+    they actually took so we can grade it later for calibration + CLV."""
+    fixture_id: str
+    market_type: str  # e.g. "home_win" / "over_2_5" / "btts_yes"
+    leg: Dict[str, object]  # canonical BetLeg dict
+    fair_probability: float
+    fair_decimal_odds: float
+    book_decimal_odds: Optional[float] = None
+    pinnacle_close_decimal: Optional[float] = None
+    edge: Optional[float] = None
+    kelly_fraction: Optional[float] = None
+    recommendation: str = "manual_record"
+
+
+class ResolveFixtureIn(BaseModel):
+    home_goals: int
+    away_goals: int
+
+
+class ResolveResultOut(BaseModel):
+    fixture_id: str
+    home_goals: int
+    away_goals: int
+    predictions_graded: int
+    bet_builder_graded: int
+    skipped_unsupported_market: int
+    calibration_records: int
+
+
 class OddsLegOut(BaseModel):
     market_key: str
     selection: str
@@ -1209,6 +1239,170 @@ def calibration(request: Request) -> List[CalibrationOut]:
     return out
 
 
+@router.post("/soccer/predictions")
+def record_prediction(
+    request: Request,
+    payload: RecordPredictionIn,
+) -> Dict[str, object]:
+    """Persist a single pick the user actually took. Required input for
+    the resolution loop and isotonic calibration — without this we have
+    no resolved samples to fit on."""
+    eng = _engine(request)
+    pid = eng.store.record_prediction(
+        fixture_id=payload.fixture_id,
+        market_type=payload.market_type,
+        leg=payload.leg,
+        fair_probability=float(payload.fair_probability),
+        fair_decimal_odds=float(payload.fair_decimal_odds),
+        book_decimal_odds=payload.book_decimal_odds,
+        pinnacle_close_decimal=payload.pinnacle_close_decimal,
+        edge=payload.edge,
+        kelly_fraction=payload.kelly_fraction,
+        recommendation=payload.recommendation,
+        recorded_unix=int(time.time()),
+    )
+    return {"ok": True, "prediction_id": pid}
+
+
+@router.post("/soccer/fixtures/{fixture_id}/resolve", response_model=ResolveResultOut)
+def resolve_fixture(
+    request: Request,
+    fixture_id: str,
+    payload: ResolveFixtureIn,
+) -> ResolveResultOut:
+    """Mark a fixture as final with the given (home_goals, away_goals)
+    and grade every recorded prediction + bet-builder quote against it.
+
+    Markets we can score from the final score alone (1X2 / totals / BTTS
+    / team total / correct score) get an outcome of 0 or 1. Player /
+    cards / corners / shots markets need a stats feed we don't ingest
+    yet and are skipped (outcome stays NULL).
+
+    After grading we refit the calibration layer so the next probability
+    surface uses the updated isotonic mapping."""
+    eng = _engine(request)
+    fixture = eng.store.fixture_get(fixture_id)
+    if fixture is None:
+        raise HTTPException(status_code=404, detail="fixture_not_found")
+    if payload.home_goals < 0 or payload.away_goals < 0:
+        raise HTTPException(status_code=400, detail="goals_must_be_non_negative")
+
+    hg = int(payload.home_goals)
+    ag = int(payload.away_goals)
+
+    # Persist the historical match so future Dixon-Coles / Elo refits
+    # see it. (Idempotent via upsert.)
+    eng.store.upsert_historical_matches([{
+        "match_id": f"resolved-{fixture_id}",
+        "home_team_id": fixture["home_team_id"],
+        "away_team_id": fixture["away_team_id"],
+        "home_goals": hg,
+        "away_goals": ag,
+        "kickoff_unix": int(fixture.get("kickoff_unix") or time.time()),
+        "neutral_venue": bool(fixture.get("neutral_venue", False)),
+        "competition": fixture.get("competition") or "",
+    }])
+
+    pred_graded = 0
+    skipped = 0
+    for row in eng.store.predictions_for_fixture(fixture_id):
+        try:
+            leg = json.loads(row.get("leg_json") or "{}")
+        except (TypeError, ValueError):
+            leg = {}
+        outcome = _grade_market_type_from_score(
+            str(row.get("market_type") or ""), leg, hg, ag,
+        )
+        if outcome is None:
+            skipped += 1
+            continue
+        eng.store.set_prediction_outcome(int(row["id"]), int(outcome))
+        pred_graded += 1
+
+    bb_graded = 0
+    for row in eng.store.bet_builder_for_fixture(fixture_id):
+        try:
+            legs = json.loads(row.get("legs_json") or "[]")
+        except (TypeError, ValueError):
+            legs = []
+        leg_outcomes = [_resolve_leg(l, hg, ag) for l in legs]
+        if not leg_outcomes or any(o is None for o in leg_outcomes):
+            # If any leg can't be graded from the score alone, we can't
+            # grade the parlay. Skip silently.
+            continue
+        eng.store.set_bet_builder_outcome(
+            int(row["id"]),
+            1 if all(o == 1 for o in leg_outcomes) else 0,
+        )
+        bb_graded += 1
+
+    eng.store.fixture_set_status(fixture_id, "CLOSED")
+    cal_n = eng.refit_calibration()
+
+    return ResolveResultOut(
+        fixture_id=fixture_id,
+        home_goals=hg,
+        away_goals=ag,
+        predictions_graded=pred_graded,
+        bet_builder_graded=bb_graded,
+        skipped_unsupported_market=skipped,
+        calibration_records=cal_n,
+    )
+
+
+@router.post("/soccer/fixtures/{fixture_id}/snapshot-closing-line")
+def snapshot_closing_line(request: Request, fixture_id: str) -> Dict[str, object]:
+    """Snapshot Pinnacle's current h2h / totals 2.5 / BTTS prices and
+    write them onto every recorded prediction for this fixture so we
+    can compute CLV after settlement. Call this within a couple of
+    minutes of kickoff for the cleanest CLV signal."""
+    eng = _engine(request)
+    if not settings.odds_api_key:
+        raise HTTPException(status_code=409, detail="odds_api_key_not_configured")
+    fixture = eng.store.fixture_get(fixture_id)
+    if fixture is None:
+        raise HTTPException(status_code=404, detail="fixture_not_found")
+    home = eng.team_names.get(fixture["home_team_id"], fixture["home_team_id"])
+    away = eng.team_names.get(fixture["away_team_id"], fixture["away_team_id"])
+    try:
+        with OddsApiClient(api_key=settings.odds_api_key, region=settings.odds_api_region) as client:
+            events = client.odds(
+                sport_key=settings.odds_api_sport_key, markets="h2h,totals,btts"
+            )
+    except OddsApiError as e:
+        raise HTTPException(status_code=502, detail=f"odds_api_error: {e}") from e
+    event = _find_odds_event(events, fixture, home, away)
+    if event is None:
+        return {"ok": False, "fixture_id": fixture_id, "updated": 0, "reason": "no_event_match"}
+
+    def _pin(market_key: str, selection: str, point: Optional[float] = None) -> Optional[float]:
+        return _best_price(event, market_key, selection, point=point, prefer_pinnacle=True)
+
+    pin_map: Dict[str, Optional[float]] = {
+        "home_win": _pin("h2h", home),
+        "draw": _pin("h2h", "Draw"),
+        "away_win": _pin("h2h", away),
+        "over_2_5": _pin("totals", "Over", 2.5),
+        "under_2_5": _pin("totals", "Under", 2.5),
+        "btts_yes": _pin("btts", "Yes"),
+        "btts_no": _pin("btts", "No"),
+    }
+    updated = 0
+    for row in eng.store.predictions_for_fixture(fixture_id):
+        mt = str(row.get("market_type") or "")
+        d = pin_map.get(mt)
+        if d is None:
+            continue
+        eng.store.set_prediction_closing_line(int(row["id"]), float(d))
+        updated += 1
+    return {
+        "ok": True,
+        "fixture_id": fixture_id,
+        "updated": updated,
+        "snapshot": {k: v for k, v in pin_map.items() if v is not None},
+    }
+
+
 def _norm_name(value: str) -> str:
     return " ".join(value.lower().replace(".", "").split())
 
@@ -1326,6 +1520,134 @@ def _outcome_matches(outcome: Dict[str, object], selection: str, point: Optional
         return abs(float(outcome.get("point")) - float(point)) < 1e-9
     except (TypeError, ValueError):
         return False
+
+
+# ----------------------------------------------------------------------
+# Resolution loop helpers — used by POST /soccer/fixtures/{id}/resolve.
+# We can only grade markets whose outcome is deterministic from the final
+# (home_goals, away_goals) tuple. Player props, cards, corners, and any
+# stat-level market need a separate stats feed and are skipped here.
+# ----------------------------------------------------------------------
+
+# Market types we know how to grade from just (hg, ag). Keep this list
+# in sync with the canonical market_type strings used by record_prediction
+# and SoccerEngine._CALIBRATE_KEYS.
+_SCORE_DERIVABLE_MARKETS = {
+    "match_result", "home_win", "draw", "away_win",
+    "total_goals", "over_1_5", "under_1_5",
+    "over_2_5", "under_2_5", "over_3_5", "under_3_5",
+    "btts", "btts_yes", "btts_no",
+    "team_total", "correct_score",
+}
+
+
+def _resolve_leg(leg: Dict[str, object], home_goals: int, away_goals: int) -> Optional[int]:
+    """Grade a BetLeg dict from the final score. Returns 1 (hit), 0
+    (miss), or None for markets that need stats we don't have."""
+    kind = str(leg.get("kind") or "").lower()
+    params = leg.get("params") or {}
+    if not isinstance(params, dict):
+        return None
+    total = home_goals + away_goals
+
+    if kind == "match_result":
+        side = str(params.get("side", "")).upper()
+        if home_goals > away_goals:
+            return 1 if side in ("H", "HOME", "1") else 0
+        if home_goals < away_goals:
+            return 1 if side in ("A", "AWAY", "2") else 0
+        return 1 if side in ("D", "DRAW", "X") else 0
+
+    if kind == "total_goals":
+        try:
+            line = float(params.get("line"))
+        except (TypeError, ValueError):
+            return None
+        side = str(params.get("side", "")).lower()
+        # Exact-integer line is a push: books refund the stake. Treat as
+        # void so the calibration layer doesn't learn a spurious miss.
+        if abs(total - line) < 1e-9:
+            return None
+        if side == "over":
+            return 1 if total > line else 0
+        if side == "under":
+            return 1 if total < line else 0
+        return None
+
+    if kind == "btts":
+        side = str(params.get("side", "")).lower()
+        both_scored = home_goals > 0 and away_goals > 0
+        if side in ("yes", "y", "true"):
+            return 1 if both_scored else 0
+        if side in ("no", "n", "false"):
+            return 1 if not both_scored else 0
+        return None
+
+    if kind == "team_total":
+        team = str(params.get("team", "")).lower()
+        try:
+            line = float(params.get("line"))
+        except (TypeError, ValueError):
+            return None
+        side = str(params.get("side", "")).lower()
+        goals = home_goals if team in ("home", "h") else (
+            away_goals if team in ("away", "a") else None
+        )
+        if goals is None:
+            return None
+        if abs(goals - line) < 1e-9:
+            return None  # exact integer line pushes
+        if side == "over":
+            return 1 if goals > line else 0
+        if side == "under":
+            return 1 if goals < line else 0
+        return None
+
+    if kind == "correct_score":
+        try:
+            h = int(params.get("home"))
+            a = int(params.get("away"))
+        except (TypeError, ValueError):
+            return None
+        return 1 if (home_goals == h and away_goals == a) else 0
+
+    # Anything else (anytime_scorer, first_scorer, player_yellow,
+    # total_cards, total_corners, total_shots, ...) needs a stats feed
+    # we don't ingest yet. Caller treats None as "skipped".
+    return None
+
+
+def _grade_market_type_from_score(
+    market_type: str, leg: Dict[str, object], home_goals: int, away_goals: int
+) -> Optional[int]:
+    """Grade a market_type string. The legacy persisted-prediction path
+    stores the canonical market_type (e.g. "over_2_5") rather than the
+    raw leg kind, so we synthesise an equivalent BetLeg dict where
+    needed."""
+    mt = market_type.lower()
+    if mt in ("home_win",):
+        return _resolve_leg({"kind": "match_result", "params": {"side": "H"}}, home_goals, away_goals)
+    if mt in ("draw",):
+        return _resolve_leg({"kind": "match_result", "params": {"side": "D"}}, home_goals, away_goals)
+    if mt in ("away_win",):
+        return _resolve_leg({"kind": "match_result", "params": {"side": "A"}}, home_goals, away_goals)
+    if mt.startswith("over_") or mt.startswith("under_"):
+        # e.g. "over_2_5" -> side=over, line=2.5
+        side, _, line_str = mt.partition("_")
+        try:
+            line = float(line_str.replace("_", "."))
+        except ValueError:
+            return None
+        return _resolve_leg(
+            {"kind": "total_goals", "params": {"line": line, "side": side}},
+            home_goals, away_goals,
+        )
+    if mt == "btts_yes":
+        return _resolve_leg({"kind": "btts", "params": {"side": "yes"}}, home_goals, away_goals)
+    if mt == "btts_no":
+        return _resolve_leg({"kind": "btts", "params": {"side": "no"}}, home_goals, away_goals)
+    # Fall back to grading the stored leg directly.
+    return _resolve_leg(leg, home_goals, away_goals)
 
 
 def _parlay_blueprints(

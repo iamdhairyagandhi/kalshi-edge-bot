@@ -1,4 +1,5 @@
-import { SoccerFixture } from "../../api/client";
+import React, { useState } from "react";
+import { api, SoccerFixture } from "../../api/client";
 
 type Props = {
   fixtures: SoccerFixture[];
@@ -11,6 +12,7 @@ type Props = {
   fitting: boolean;
   fitInfo: string | null;
   seedError: string | null;
+  onResolved?: () => void;
 };
 
 function fmtPct(p: number | null | undefined): string {
@@ -26,7 +28,7 @@ function fmtTime(unix: number): string {
 }
 
 export default function FixturesPanel({
-  fixtures, selectedId, onSelect, empty, onSeedDemo, onFitReal, onLoadOddsFixtures, fitting, fitInfo, seedError,
+  fixtures, selectedId, onSelect, empty, onSeedDemo, onFitReal, onLoadOddsFixtures, fitting, fitInfo, seedError, onResolved,
 }: Props) {
   return (
     <div className="panel">
@@ -91,38 +93,43 @@ export default function FixturesPanel({
               const home = f.home_team_name || f.home_team_id;
               const away = f.away_team_name || f.away_team_id;
               return (
-                <button
-                  key={f.fixture_id}
-                  onClick={() => onSelect(f.fixture_id)}
-                  style={{
-                    textAlign: "left",
-                    background: sel ? "rgba(80,180,255,0.13)" : "rgba(255,255,255,0.02)",
-                    border: `1px solid ${sel ? "var(--cyan-dim)" : "var(--border)"}`,
-                    borderRadius: 4,
-                    padding: "8px 9px",
-                    cursor: "pointer",
-                    color: "var(--fg-0)",
-                  }}
-                >
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
-                    <div className="mono dim" style={{ fontSize: 10 }}>{fmtTime(f.kickoff_unix)}</div>
-                    <div className="mono" style={{ fontSize: 10, color: sel ? "var(--cyan)" : "var(--fg-2)" }}>
-                      {f.competition?.replace("soccer_", "") || "fixture"}
+                <div key={f.fixture_id}>
+                  <button
+                    onClick={() => onSelect(f.fixture_id)}
+                    style={{
+                      width: "100%",
+                      textAlign: "left",
+                      background: sel ? "rgba(80,180,255,0.13)" : "rgba(255,255,255,0.02)",
+                      border: `1px solid ${sel ? "var(--cyan-dim)" : "var(--border)"}`,
+                      borderRadius: 4,
+                      padding: "8px 9px",
+                      cursor: "pointer",
+                      color: "var(--fg-0)",
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+                      <div className="mono dim" style={{ fontSize: 10 }}>{fmtTime(f.kickoff_unix)}</div>
+                      <div className="mono" style={{ fontSize: 10, color: sel ? "var(--cyan)" : "var(--fg-2)" }}>
+                        {f.competition?.replace("soccer_", "") || "fixture"}
+                      </div>
                     </div>
-                  </div>
-                  <div className="mono" style={{ fontSize: 14, marginTop: 5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {home} <span className="dim">vs</span> {away}
-                  </div>
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 4, marginTop: 8 }}>
-                    <Chip label="H" value={fmtPct(f.home_win)} hot={sel} />
-                    <Chip label="D" value={fmtPct(f.draw)} />
-                    <Chip label="A" value={fmtPct(f.away_win)} />
-                  </div>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginTop: 4 }}>
-                    <Chip label="O2.5" value={fmtPct(f.over_2_5)} muted />
-                    <Chip label="BTTS" value={fmtPct(f.btts_yes)} muted />
-                  </div>
-                </button>
+                    <div className="mono" style={{ fontSize: 14, marginTop: 5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {home} <span className="dim">vs</span> {away}
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 4, marginTop: 8 }}>
+                      <Chip label="H" value={fmtPct(f.home_win)} hot={sel} />
+                      <Chip label="D" value={fmtPct(f.draw)} />
+                      <Chip label="A" value={fmtPct(f.away_win)} />
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginTop: 4 }}>
+                      <Chip label="O2.5" value={fmtPct(f.over_2_5)} muted />
+                      <Chip label="BTTS" value={fmtPct(f.btts_yes)} muted />
+                    </div>
+                  </button>
+                  {sel ? (
+                    <ResolveBar fixtureId={f.fixture_id} onResolved={onResolved} />
+                  ) : null}
+                </div>
               );
             })}
           </div>
@@ -152,4 +159,146 @@ function Chip({ label, value, hot, muted }: { label: string; value: string; hot?
       <span>{value}</span>
     </span>
   );
+}
+
+function ResolveBar({
+  fixtureId, onResolved,
+}: { fixtureId: string; onResolved?: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [home, setHome] = useState("");
+  const [away, setAway] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+
+  async function resolve() {
+    const hg = parseInt(home, 10);
+    const ag = parseInt(away, 10);
+    if (!Number.isFinite(hg) || !Number.isFinite(ag) || hg < 0 || ag < 0) {
+      setStatus("enter non-negative integers");
+      return;
+    }
+    setBusy(true);
+    setStatus(null);
+    try {
+      const r = await api.soccerResolveFixture(fixtureId, { home_goals: hg, away_goals: ag });
+      setStatus(
+        `graded ${r.predictions_graded} preds, ${r.bet_builder_graded} parlays, ` +
+        `skipped ${r.skipped_unsupported_market} stat markets · ` +
+        `${r.calibration_records} resolved samples now feeding calibration`,
+      );
+      setHome("");
+      setAway("");
+      onResolved?.();
+    } catch (e) {
+      setStatus(`error: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function snapshot() {
+    setBusy(true);
+    setStatus(null);
+    try {
+      const r = await api.soccerSnapshotClosingLine(fixtureId);
+      if (!r.ok) {
+        setStatus(`snapshot skipped: ${r.reason ?? "no_match"}`);
+      } else {
+        setStatus(`snapshot updated ${r.updated} prediction(s)`);
+      }
+    } catch (e) {
+      setStatus(`error: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!open) {
+    return (
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 6, marginTop: 4 }}>
+        <button
+          onClick={() => setOpen(true)}
+          className="mono"
+          style={{
+            background: "var(--bg-3)", color: "var(--fg-2)", border: "1px solid var(--border)",
+            padding: "2px 8px", borderRadius: 2, fontSize: 10, cursor: "pointer",
+            letterSpacing: "0.1em",
+          }}
+        >RESOLVE</button>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{
+      border: "1px solid var(--border)", borderRadius: 4, padding: 8, marginTop: 4,
+      display: "grid", gap: 6, background: "rgba(255,255,255,0.02)",
+    }}>
+      <div className="mono dim" style={{ fontSize: 10, letterSpacing: "0.1em" }}>
+        FINAL SCORE · grades 1X2 / totals / BTTS / team_total / correct_score
+      </div>
+      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+        <input
+          inputMode="numeric"
+          placeholder="H"
+          value={home}
+          onChange={(e) => setHome(e.target.value)}
+          disabled={busy}
+          style={inputStyle()}
+        />
+        <span className="mono dim">:</span>
+        <input
+          inputMode="numeric"
+          placeholder="A"
+          value={away}
+          onChange={(e) => setAway(e.target.value)}
+          disabled={busy}
+          style={inputStyle()}
+        />
+        <button
+          onClick={resolve}
+          disabled={busy}
+          className="mono"
+          style={{
+            background: "rgba(25,195,125,0.18)", color: "var(--green)",
+            border: "1px solid var(--green-dim)",
+            padding: "3px 10px", borderRadius: 2, fontSize: 10, cursor: busy ? "wait" : "pointer",
+            letterSpacing: "0.1em",
+          }}
+        >{busy ? "…" : "GRADE"}</button>
+        <button
+          onClick={snapshot}
+          disabled={busy}
+          className="mono"
+          style={{
+            background: "var(--bg-3)", color: "var(--cyan)", border: "1px solid var(--cyan-dim)",
+            padding: "3px 10px", borderRadius: 2, fontSize: 10, cursor: busy ? "wait" : "pointer",
+            letterSpacing: "0.1em",
+          }}
+        >SNAPSHOT CL</button>
+        <button
+          onClick={() => { setOpen(false); setStatus(null); }}
+          disabled={busy}
+          className="mono"
+          style={{
+            background: "var(--bg-3)", color: "var(--fg-2)", border: "1px solid var(--border)",
+            padding: "3px 8px", borderRadius: 2, fontSize: 10, cursor: "pointer",
+          }}
+        >×</button>
+      </div>
+      {status ? (
+        <div className="mono" style={{ fontSize: 10, color: status.startsWith("error") ? "var(--red)" : "var(--fg-2)" }}>
+          {status}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function inputStyle(): React.CSSProperties {
+  return {
+    width: 44, background: "var(--bg-3)", color: "var(--fg)",
+    border: "1px solid var(--border)", padding: "3px 6px",
+    borderRadius: 2, fontFamily: "var(--mono)", fontSize: 12, textAlign: "center",
+  };
 }

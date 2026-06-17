@@ -135,6 +135,7 @@ export default function SoccerTab() {
           fitting={fitting}
           fitInfo={fitInfo}
           seedError={seedingError}
+          onResolved={refreshFixtures}
         />
       </section>
 

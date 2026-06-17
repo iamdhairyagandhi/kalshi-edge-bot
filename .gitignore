@@ -14,8 +14,8 @@ __pycache__/
 build/
 dist/
 
-# Data
-data/
+# Data — root only, NOT src/sports/soccer/data which is source code.
+/data/
 logs/
 *.db
 *.sqlite
