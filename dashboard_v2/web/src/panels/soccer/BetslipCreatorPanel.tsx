@@ -59,7 +59,7 @@ export default function BetslipCreatorPanel({ onUseLegs, onSelectFixture }: Prop
   const [minEdge, setMinEdge] = useState("0.03");
   const [horizon, setHorizon] = useState<Horizon>("today");
 
-  async function create() {
+  async function create(h: Horizon = horizon) {
     setLoading(true);
     setErr(null);
     try {
@@ -67,13 +67,24 @@ export default function BetslipCreatorPanel({ onUseLegs, onSelectFixture }: Prop
         14,
         parseFloat(bankroll),
         parseFloat(minEdge),
-        horizonHours(horizon),
+        horizonHours(h),
       );
       setBatch(b);
     } catch (e: any) {
       setErr(String(e));
     } finally {
       setLoading(false);
+    }
+  }
+
+  function pickHorizon(h: Horizon) {
+    if (h === horizon) return;
+    setHorizon(h);
+    // Only auto-refetch if the user has already loaded a batch — otherwise
+    // first click on a pill shouldn't kick off an API call before they've
+    // even set bankroll / min-edge.
+    if (batch) {
+      create(h);
     }
   }
 
@@ -97,14 +108,14 @@ export default function BetslipCreatorPanel({ onUseLegs, onSelectFixture }: Prop
             {(["today", "week", "all"] as Horizon[]).map((h) => (
               <button
                 key={h}
-                onClick={() => setHorizon(h)}
+                onClick={() => pickHorizon(h)}
                 disabled={loading}
                 style={pillStyle(horizon === h)}
               >{horizonLabel(h)}</button>
             ))}
           </div>
           <button
-            onClick={create}
+            onClick={() => create()}
             disabled={loading}
             style={{
               background: "rgba(25,195,125,0.18)", color: "var(--green)",
