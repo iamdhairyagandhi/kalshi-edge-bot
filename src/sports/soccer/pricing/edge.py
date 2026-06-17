@@ -1,0 +1,118 @@
+"""
+Edge calculation + Kelly staking.
+
+All numbers are in decimal-odds convention:
+  decimal_odds = 1 + payout_per_unit_stake
+  implied_prob = 1 / decimal_odds
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable, Optional
+
+
+def decimal_to_implied_prob(d: float) -> float:
+    if d <= 1.0:
+        return 1.0
+    return 1.0 / d
+
+
+def implied_prob_to_decimal(p: float) -> float:
+    if p <= 0.0:
+        return float("inf")
+    return 1.0 / p
+
+
+def fair_decimal_from_prob(p: float) -> float:
+    return implied_prob_to_decimal(p)
+
+
+def overround(decimal_odds: Iterable[float]) -> float:
+    """Sum of implied probabilities across mutually exclusive outcomes - 1.
+
+    e.g. 1X2 with overround 0.05 means books are charging a 5% margin.
+    """
+    return sum(decimal_to_implied_prob(d) for d in decimal_odds) - 1.0
+
+
+def edge_decimal(p_true: float, book_decimal: float) -> float:
+    """Expected return per unit stake at the given decimal odds.
+
+    EV = p · (book - 1) - (1 - p) = p · book - 1
+    """
+    return p_true * book_decimal - 1.0
+
+
+def fractional_kelly(
+    p_true: float,
+    book_decimal: float,
+    *,
+    fraction: float = 0.5,
+    cap: float = 0.05,
+) -> float:
+    """Fractional Kelly stake fraction of bankroll.
+
+    Full Kelly: f* = (b·p - q) / b where b = book - 1, q = 1 - p.
+    Returns max(0, fraction · f*) capped at `cap`.
+    """
+    if book_decimal <= 1.0 or not (0.0 < p_true < 1.0):
+        return 0.0
+    b = book_decimal - 1.0
+    q = 1.0 - p_true
+    f_full = (b * p_true - q) / b
+    if f_full <= 0:
+        return 0.0
+    return min(fraction * f_full, cap)
+
+
+@dataclass
+class EdgeReport:
+    fair_probability: float
+    fair_decimal_odds: float
+    book_decimal_odds: Optional[float]
+    edge: Optional[float]
+    kelly_fraction: float
+    recommendation: str
+    notes: Optional[str] = None
+
+
+def report_edge(
+    fair_probability: float,
+    book_decimal_odds: Optional[float],
+    *,
+    min_edge: float = 0.02,
+    kelly_fraction: float = 0.5,
+    kelly_cap: float = 0.05,
+) -> EdgeReport:
+    fair_d = fair_decimal_from_prob(fair_probability)
+    if book_decimal_odds is None:
+        return EdgeReport(
+            fair_probability=fair_probability,
+            fair_decimal_odds=fair_d,
+            book_decimal_odds=None,
+            edge=None,
+            kelly_fraction=0.0,
+            recommendation="no_book_quote",
+        )
+    edge = edge_decimal(fair_probability, book_decimal_odds)
+    kelly = fractional_kelly(
+        fair_probability,
+        book_decimal_odds,
+        fraction=kelly_fraction,
+        cap=kelly_cap,
+    )
+    if edge > min_edge and kelly > 0:
+        rec = "bet"
+    elif edge > 0:
+        rec = "thin_edge"
+    else:
+        rec = "no_bet"
+    return EdgeReport(
+        fair_probability=fair_probability,
+        fair_decimal_odds=fair_d,
+        book_decimal_odds=book_decimal_odds,
+        edge=edge,
+        kelly_fraction=kelly,
+        recommendation=rec,
+    )

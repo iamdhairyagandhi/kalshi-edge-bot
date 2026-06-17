@@ -185,6 +185,80 @@ export type WeatherSnapshot = {
   rows: WeatherEstimate[];
 };
 
+/* ---------- Soccer (FIFA WC bet builder) ---------- */
+
+export type SoccerTeam = {
+  team_id: string; name: string; country: string | null;
+  elo: number; attack: number; defense: number;
+};
+
+export type SoccerFixture = {
+  fixture_id: string;
+  home_team_id: string; home_team_name: string | null;
+  away_team_id: string; away_team_name: string | null;
+  kickoff_unix: number;
+  competition: string | null;
+  neutral_venue: boolean;
+  referee_id: string | null;
+  home_win: number | null;
+  draw: number | null;
+  away_win: number | null;
+  over_2_5: number | null;
+  btts_yes: number | null;
+};
+
+export type SoccerTopScorer = { player_id: string; name: string; anytime: number };
+
+export type SoccerMatchSummary = {
+  fixture: SoccerFixture;
+  score_matrix: number[][];
+  outcome: Record<string, number>;
+  top_scorer_probs: SoccerTopScorer[];
+  cards_distribution: Record<string, number>;
+};
+
+export type SoccerBetLeg = {
+  kind: string;
+  params: Record<string, unknown>;
+  book_decimal_odds?: number | null;
+  label?: string | null;
+};
+
+export type SoccerBetBuilderQuote = {
+  fair_probability: number;
+  fair_decimal_odds: number;
+  n_sims: number;
+  leg_probabilities: number[];
+  independent_product: number;
+  correlation_factor: number;
+  book_decimal_odds: number | null;
+  edge: number | null;
+  kelly_fraction: number | null;
+  recommendation: string;
+  notes: string | null;
+};
+
+export type SoccerOddsLeg = {
+  market_key: string;
+  selection: string;
+  best_decimal: number | null;
+  pinnacle_decimal: number | null;
+  book_count: number;
+};
+
+export type SoccerOddsForFixture = {
+  fixture_id: string;
+  legs: SoccerOddsLeg[];
+  fetched_at_unix: number;
+};
+
+export type SoccerCalibrationRow = {
+  market_type: string;
+  n_resolved: number;
+  brier: number;
+  reliability: { bin_lo: number; bin_hi: number; n: number; predicted: number; observed: number }[];
+};
+
 async function getJSON<T>(path: string): Promise<T> {
   const r = await fetch(path);
   if (!r.ok) throw new Error(`${path} → ${r.status}`);
@@ -219,6 +293,35 @@ export const api = {
   book:      (conditionId: string, outcomeIndex = 0) =>
               getJSON<Orderbook>(`/api/markets/polymarket/${conditionId}/book?outcome_index=${outcomeIndex}`),
   health:    () => getJSON<{ ok: boolean }>("/api/health"),
+  // Soccer
+  soccerSeedDemo: () => postJSON<{ ok: boolean }>("/api/soccer/seed-demo", {}),
+  soccerFitStatsBomb: (body?: {
+                competitions?: { competition_id: number; season_id: number; neutral?: boolean }[];
+                decay_per_day?: number;
+              }) => postJSON<{
+                ok: boolean;
+                fit_source: string;
+                competitions: string[];
+                matches_used: number;
+                teams: number;
+                decay_per_day: number;
+              }>("/api/soccer/fit-statsbomb", body || {}),
+  soccerTeams:    () => getJSON<SoccerTeam[]>("/api/soccer/teams"),
+  soccerFixtures: () => getJSON<SoccerFixture[]>("/api/soccer/fixtures"),
+  soccerMatch:    (fixtureId: string, nSims = 5000) =>
+              getJSON<SoccerMatchSummary>(`/api/soccer/match/${encodeURIComponent(fixtureId)}?n_sims=${nSims}`),
+  soccerBetBuilder: (payload: {
+                fixture_id: string;
+                legs: SoccerBetLeg[];
+                book_decimal_odds?: number | null;
+                n_sims?: number;
+                persist?: boolean;
+              }) => postJSON<SoccerBetBuilderQuote>("/api/soccer/bet-builder", payload),
+  soccerOdds:     (fixtureId: string, legs?: string) =>
+              getJSON<SoccerOddsForFixture>(
+                `/api/soccer/odds/${encodeURIComponent(fixtureId)}${legs ? `?legs=${encodeURIComponent(legs)}` : ""}`,
+              ),
+  soccerCalibration: () => getJSON<SoccerCalibrationRow[]>("/api/soccer/calibration"),
 };
 
 /* ----- WebSocket with auto-reconnect ----- */

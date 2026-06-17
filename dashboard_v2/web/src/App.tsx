@@ -15,14 +15,16 @@ import OrderbookDepth from "./panels/OrderbookDepth";
 import CrossVenueSpread from "./panels/CrossVenueSpread";
 import TradeBlockers from "./panels/TradeBlockers";
 import WeatherSpecialist from "./panels/WeatherSpecialist";
+import SoccerTab from "./panels/soccer/SoccerTab";
 
-type DashboardTab = "live" | "smart" | "weather" | "arbitrage" | "risk";
+type DashboardTab = "live" | "smart" | "weather" | "arbitrage" | "soccer" | "risk";
 
 const tabs: { id: DashboardTab; label: string }[] = [
   { id: "live", label: "Live Trades" },
   { id: "smart", label: "Smart Money" },
   { id: "weather", label: "Weather" },
   { id: "arbitrage", label: "Arbitrage" },
+  { id: "soccer", label: "Soccer" },
   { id: "risk", label: "Risk" },
 ];
 
@@ -90,6 +92,7 @@ export default function App() {
         {activeTab === "smart" ? <SmartMoneyTab /> : null}
         {activeTab === "weather" ? <WeatherTab /> : null}
         {activeTab === "arbitrage" ? <ArbitrageTab /> : null}
+        {activeTab === "soccer" ? <SoccerTab /> : null}
         {activeTab === "risk" ? <RiskTab /> : null}
       </div>
     </>

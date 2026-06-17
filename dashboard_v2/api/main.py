@@ -19,7 +19,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from dashboard_v2.api.routes import (
-    calibration, cohort, cross_venue, diagnostics, killswitch, markets, portfolio, positions, signals, weather,
+    calibration, cohort, cross_venue, diagnostics, killswitch, markets, portfolio, positions, signals, soccer, weather,
 )
 from dashboard_v2.api.stream import StreamHub, start_pollers
 
@@ -89,6 +89,7 @@ app.include_router(killswitch.router, prefix="/api", tags=["killswitch"])
 app.include_router(cross_venue.router, prefix="/api", tags=["cross-venue"])
 app.include_router(diagnostics.router, prefix="/api", tags=["diagnostics"])
 app.include_router(weather.router, prefix="/api", tags=["weather"])
+app.include_router(soccer.router, prefix="/api", tags=["soccer"])
 
 
 @app.get("/api/health")

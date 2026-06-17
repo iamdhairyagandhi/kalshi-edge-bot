@@ -31,6 +31,15 @@ What's built:
   (`src/strategies/cross_venue_spread.py`, `src/jobs/cross_venue_runner.py`)
 - ✅ React/FastAPI dashboard v2 with cohort, consensus signal, latency,
   orderbook, cross-venue spread, and kill-switch panels (`dashboard_v2/`)
+- ✅ Soccer / FIFA WC bet-builder pipeline: World Football Elo,
+  Dixon-Coles bivariate Poisson with τ correction, position-prior
+  player-share, minutes/cards models, Kalman state-space updater,
+  10k-sim joint Monte Carlo simulator, bet-builder pricing with
+  correlation factor + edge + Kelly, isotonic calibration + CLV vs
+  Pinnacle, StatsBomb open-data + The Odds API ingest, "Soccer"
+  dashboard tab with interactive bet builder
+  (`src/sports/soccer/`, `dashboard_v2/api/routes/soccer.py`,
+   `dashboard_v2/web/src/panels/soccer/`)
 
 What's next:
 - [ ] Add Kalshi WebSocket ingest for lower-latency orderbook updates
@@ -113,6 +122,10 @@ pytest
 | Polymarket consensus threshold (K) | 5 |
 | Polymarket min wallet trades | 50 |
 | Polymarket min wallet resolved markets | 20 |
+| Soccer min edge (decimal) to recommend | 3% |
+| Soccer Kelly fraction | 0.25 (quarter Kelly) |
+| Soccer Kelly cap | 2% of bankroll |
+| Soccer simulations per quote | 10,000 |
 
 All tunable in `src/risk/gates.py` and `src/config.py`. Don't loosen
 them without a backtest.
@@ -137,6 +150,39 @@ cli.py polymarket-leaderboard   Re-rank the leaderboard under our criteria + sho
 cli.py polymarket-scan          One consensus-copy scan + (paper) execute pass
 cli.py cross-venue-scan         Compare likely-equivalent Kalshi/Polymarket spreads
 ```
+
+Soccer / FIFA WC commands:
+```
+cli.py soccer-ingest   Pull StatsBomb open-data (WC 2018/2022 + Euro 2020/2024) and refit Elo + Dixon-Coles
+cli.py soccer-fetch    Cache StatsBomb open-data matches for a single competition/season
+cli.py soccer-fit      Fit Dixon-Coles + Elo from cached matches and print diagnostics
+cli.py soccer-simulate Run a 10k-sim Monte Carlo simulation for a fixture
+```
+
+The Soccer dashboard tab exposes two buttons: **FIT REAL DATA**
+(StatsBomb open-data ingest, ~5s, 230 real matches across the last
+two World Cups + Euros, Spain/England/France/etc. team strengths
+reflecting real tournament form) and **SEED DEMO MODEL** (synthetic
+priors only, for offline use).
+
+The Soccer dashboard tab also exposes an interactive bet builder that
+hits `/api/soccer/bet-builder` (POST) — pick legs, paste in a
+bookmaker's combined SGP price, and the panel returns fair price,
+correlation factor, edge, and Kelly stake. The model layer is
+documented inline in `src/sports/soccer/`:
+
+| Layer | File | Notes |
+|---|---|---|
+| Team strength | `models/dixon_coles.py` | Bivariate Poisson + τ correction, MLE with time decay |
+| Ratings prior | `ratings/elo.py` | World Football Elo (tournament K, GD multiplier, home advantage) |
+| In-tournament | `models/state_space.py` | Per-team Kalman update on attack/defense |
+| Player share | `models/player_share.py` | Dirichlet-multinomial; cold-start from positions, refit from history |
+| Minutes | `models/minutes.py` | Start prob + sub timing; minute factor for scorer sampling |
+| Cards | `models/cards.py` | Per-player Poisson with referee strictness multiplier |
+| Simulator | `simulator/match_sim.py` | Joint MC: minutes → goals → scorers → cards |
+| Bet builder | `simulator/bet_builder.py` | Predicate library + counting → fair price |
+| Calibration | `calibration/isotonic.py` | sklearn isotonic per market type + CLV vs Pinnacle close |
+| Pricing | `pricing/edge.py` | Edge, fractional Kelly with cap |
 
 ## Dashboard
 
@@ -180,6 +226,11 @@ Portions of the Kalshi client and position tracker will be ported from
 [polymarket-client](https://pypi.org/project/polymarket-client/) SDK
 (beta) for any live-execution work; the read-only data layer is built
 directly against Polymarket's public Gamma / Data / CLOB / LB APIs.
+
+The soccer pipeline uses [StatsBomb open data](https://github.com/statsbomb/open-data)
+(free for non-commercial use, CC-BY-NC) for historical xG/event data
+and [The Odds API](https://the-odds-api.com) (free tier) for leg-level
+market odds. CLV benchmarking targets Pinnacle's closing line.
 
 ## License
 

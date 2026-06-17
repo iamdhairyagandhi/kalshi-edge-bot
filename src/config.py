@@ -133,5 +133,22 @@ class Settings:
     weather_safety_buffer: float = field(default_factory=lambda: _env_float("WEATHER_SAFETY_BUFFER", 0.03))
     weather_min_confidence: float = field(default_factory=lambda: _env_float("WEATHER_MIN_CONFIDENCE", 0.70))
 
+    # ------------------------------------------------------------------
+    # Soccer / World Cup bet builder
+    # ------------------------------------------------------------------
+    soccer_db_path: str = field(default_factory=lambda: _env("SOCCER_DB_PATH", "data/soccer.db"))
+    soccer_data_cache_dir: str = field(default_factory=lambda: _env("SOCCER_DATA_CACHE_DIR", "data/soccer_cache"))
+    soccer_n_sims: int = field(default_factory=lambda: _env_int("SOCCER_N_SIMS", 10000))
+    soccer_max_goals: int = field(default_factory=lambda: _env_int("SOCCER_MAX_GOALS", 10))
+    soccer_min_edge: float = field(default_factory=lambda: _env_float("SOCCER_MIN_EDGE", 0.03))
+    soccer_kelly_fraction: float = field(default_factory=lambda: _env_float("SOCCER_KELLY_FRACTION", 0.25))
+    soccer_kelly_cap: float = field(default_factory=lambda: _env_float("SOCCER_KELLY_CAP", 0.02))
+    soccer_decay_per_day: float = field(default_factory=lambda: _env_float("SOCCER_DECAY_PER_DAY", 0.0019))  # ~half-life 1y
+
+    # The Odds API (https://the-odds-api.com)
+    odds_api_key: Optional[str] = field(default_factory=lambda: _env("ODDS_API_KEY"))
+    odds_api_region: str = field(default_factory=lambda: _env("ODDS_API_REGION", "eu"))
+    odds_api_sport_key: str = field(default_factory=lambda: _env("ODDS_API_SPORT_KEY", "soccer_fifa_world_cup"))
+
 
 settings = Settings()

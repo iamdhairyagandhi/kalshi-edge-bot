@@ -19,6 +19,7 @@ data/
 logs/
 *.db
 *.sqlite
+.soccer-cache/
 
 # IDE
 .vscode/

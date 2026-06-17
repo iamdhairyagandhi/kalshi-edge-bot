@@ -580,6 +580,155 @@ def weather_scan(
     asyncio.run(_go())
 
 
+# =====================================================================
+# Soccer / FIFA WC bet builder
+# =====================================================================
+
+@app.command("soccer-fetch")
+def soccer_fetch(
+    competition: int = typer.Option(43, "--competition", "-c",
+                                    help="StatsBomb competition_id (default 43 = FIFA WC)"),
+    season: int = typer.Option(106, "--season", "-s",
+                               help="StatsBomb season_id (default 106 = 2022)"),
+    cache_dir: str = typer.Option(None, "--cache-dir",
+                                   help="Override cache dir (defaults to settings.soccer_data_cache_dir)"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Download StatsBomb open-data matches for a competition/season into the local cache."""
+    _setup_logging(verbose)
+    from src.sports.soccer.data.statsbomb import StatsBombOpenData
+    from src.sports.soccer.data.store import SoccerStore
+
+    cdir = cache_dir or settings.soccer_data_cache_dir
+    typer.echo(f"caching to {cdir}")
+    with StatsBombOpenData(cache_dir=cdir) as sb:
+        comps = sb.competitions()
+        match = next((c for c in comps if int(c["competition_id"]) == competition and int(c["season_id"]) == season), None)
+        if match is None:
+            typer.echo(f"competition_id={competition} season_id={season} not in StatsBomb open-data; "
+                       "available competitions:", err=True)
+            for c in comps[:10]:
+                typer.echo(f"  {c['competition_id']}/{c['season_id']} {c['competition_name']} {c['season_name']}", err=True)
+            raise typer.Exit(2)
+        typer.echo(f"fetching {match['competition_name']} {match['season_name']}")
+        rows = sb.matches_for_dixon_coles(competition, season, neutral_default=True)
+        typer.echo(f"got {len(rows)} matches")
+        # Persist to soccer DB as fixtures of competition='HISTORY' so the
+        # dashboard's upcoming-fixtures filter ignores them, but the
+        # Dixon-Coles fitter can still load them via store extension later.
+        # For v1 we just print stats; fitting is in `soccer-fit`.
+        store = SoccerStore(settings.soccer_db_path)
+        # ensure DB is at least created
+        _ = store
+        if rows:
+            sample = rows[0]
+            typer.echo(f"sample row: {sample}")
+        typer.echo("Use `cli.py soccer-fit` to fit Dixon-Coles on the cached matches.")
+
+
+@app.command("soccer-fit")
+def soccer_fit(
+    competition: int = typer.Option(43, "--competition", "-c"),
+    season: int = typer.Option(106, "--season", "-s"),
+    cache_dir: str = typer.Option(None, "--cache-dir"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Fit Dixon-Coles + Elo from cached StatsBomb data and dump diagnostics."""
+    _setup_logging(verbose)
+    from src.sports.soccer.data.statsbomb import StatsBombOpenData
+    from src.sports.soccer.models.dixon_coles import DixonColesModel
+    from src.sports.soccer.ratings.elo import EloTable
+
+    cdir = cache_dir or settings.soccer_data_cache_dir
+    with StatsBombOpenData(cache_dir=cdir) as sb:
+        rows = sb.matches_for_dixon_coles(competition, season, neutral_default=True)
+    if not rows:
+        typer.echo("no matches available — run `soccer-fetch` first", err=True)
+        raise typer.Exit(2)
+    elo = EloTable()
+    elo.fit(rows)
+    typer.echo(f"Elo top 8: {sorted(elo.to_dict().items(), key=lambda kv: -kv[1])[:8]}")
+    dc = DixonColesModel.fit(rows, decay_per_day=settings.soccer_decay_per_day)
+    typer.echo(f"DC home_advantage={dc.params.home_advantage:.3f} rho={dc.params.rho:.3f} "
+               f"loglik={dc.params.log_likelihood:.1f} n={dc.params.n_matches}")
+
+
+@app.command("soccer-ingest")
+def soccer_ingest(
+    cache_dir: str = typer.Option(None, "--cache-dir"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Pull StatsBomb open-data for WC 2018, WC 2022, Euro 2020, Euro 2024
+    into the soccer DB, then refit Elo + Dixon-Coles. Replaces synthetic
+    demo data with real match data."""
+    _setup_logging(verbose)
+    from dashboard_v2.api.routes.soccer import _DEFAULT_STATSBOMB_COMPS, SoccerEngine
+
+    eng = SoccerEngine()
+    typer.echo("ingesting StatsBomb open-data (WC18/WC22/Euro20/Euro24)...")
+    info = eng.fit_from_statsbomb(
+        _DEFAULT_STATSBOMB_COMPS,
+        cache_dir=cache_dir,
+    )
+    typer.echo(f"matches: {info['matches_used']}")
+    typer.echo(f"teams:   {info['teams']}")
+    typer.echo("competitions:")
+    for c in info["competitions"]:
+        typer.echo(f"  {c}")
+    top = sorted(eng.elo.to_dict().items(), key=lambda kv: -kv[1])[:8]
+    typer.echo("Top 8 Elo:")
+    for tid, r in top:
+        typer.echo(f"  {tid:>5} {eng.team_names.get(tid, '?'):<22} {r:.0f}")
+
+
+@app.command("soccer-simulate")
+def soccer_simulate(
+    home: str = typer.Argument(..., help="Home team id"),
+    away: str = typer.Argument(..., help="Away team id"),
+    competition: int = typer.Option(43, "--competition", "-c"),
+    season: int = typer.Option(106, "--season", "-s"),
+    n_sims: int = typer.Option(10000, "--n-sims", "-n"),
+    neutral: bool = typer.Option(True, "--neutral/--home-game"),
+    cache_dir: str = typer.Option(None, "--cache-dir"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Run a Monte Carlo simulation of a fixture using cached StatsBomb data."""
+    _setup_logging(verbose)
+    from src.sports.soccer.data.statsbomb import StatsBombOpenData
+    from src.sports.soccer.models.cards import CardsModel
+    from src.sports.soccer.models.dixon_coles import DixonColesModel
+    from src.sports.soccer.models.minutes import MinutesModel
+    from src.sports.soccer.models.player_share import PlayerShareModel
+    from src.sports.soccer.simulator.match_sim import MatchSimulator, SimulationConfig
+
+    cdir = cache_dir or settings.soccer_data_cache_dir
+    with StatsBombOpenData(cache_dir=cdir) as sb:
+        rows = sb.matches_for_dixon_coles(competition, season, neutral_default=True)
+    if not rows:
+        typer.echo("no matches available — run `soccer-fetch` first", err=True)
+        raise typer.Exit(2)
+    dc = DixonColesModel.fit(rows, decay_per_day=settings.soccer_decay_per_day)
+    sm_probs = dc.outcome_probs(home, away, neutral=neutral)
+    typer.echo(f"DC outcome: {sm_probs}")
+
+    # Rough player share: empty (no lineups loaded). Sim will still produce
+    # goals/cards distributions; scorer attribution will fall through to the
+    # unlisted bucket.
+    share = PlayerShareModel()
+    share.team_to_players[home] = []
+    share.team_to_players[away] = []
+    minutes = MinutesModel()
+    cards = CardsModel()
+    sim = MatchSimulator(score_model=dc, player_share=share, minutes=minutes, cards=cards,
+                         squads={home: [], away: []})
+    sims = sim.simulate(home, away, neutral_venue=neutral,
+                         config=SimulationConfig(n_sims=n_sims, seed=0))
+    avg_goals = sum(s.total_goals for s in sims) / len(sims)
+    p_home = sum(1 for s in sims if s.result == "H") / len(sims)
+    p_btts = sum(1 for s in sims if s.btts) / len(sims)
+    typer.echo(f"sim: avg goals={avg_goals:.2f} P(home)={p_home:.3f} P(btts)={p_btts:.3f}")
+
+
 def main() -> None:
     try:
         app()
