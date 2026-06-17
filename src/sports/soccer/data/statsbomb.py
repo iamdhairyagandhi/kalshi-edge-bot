@@ -254,3 +254,95 @@ class StatsBombOpenData:
                         })
                         row["goals"] = int(row["goals"]) + 1
         return list(agg.values())
+
+    # ------------------------------------------------------------------
+    # Shot-level extractor for the xG model.
+    # ------------------------------------------------------------------
+    def shots_for_match(self, match_id: int) -> List[Dict[str, object]]:
+        """Flatten shot events for a single match into rows compatible with
+        XgModel.fit / predict.
+
+        Returns rows with: match_id, team_id, player_id, x, y, body_part,
+        technique, shot_type, first_time, under_pressure, one_on_one,
+        open_goal, minute, is_goal, statsbomb_xg (raw, for reference only).
+        """
+        try:
+            events = self.events(match_id)
+        except (httpx.HTTPError, OSError) as e:  # pragma: no cover
+            _LOG.warning("could not load events for %s: %s", match_id, e)
+            return []
+        out: List[Dict[str, object]] = []
+        for ev in events:
+            if ev.get("type", {}).get("name") != "Shot":
+                continue
+            shot = ev.get("shot", {}) or {}
+            loc = ev.get("location") or [None, None]
+            if not isinstance(loc, (list, tuple)) or len(loc) < 2:
+                continue
+            try:
+                x = float(loc[0]) if loc[0] is not None else None
+                y = float(loc[1]) if loc[1] is not None else None
+            except (TypeError, ValueError):
+                continue
+            if x is None or y is None:
+                continue
+            body_part = ""
+            if isinstance(shot.get("body_part"), dict):
+                body_part = str(shot["body_part"].get("name") or "")
+            technique = ""
+            if isinstance(shot.get("technique"), dict):
+                technique = str(shot["technique"].get("name") or "")
+            shot_type = ""
+            if isinstance(shot.get("type"), dict):
+                shot_type = str(shot["type"].get("name") or "")
+            outcome = ""
+            if isinstance(shot.get("outcome"), dict):
+                outcome = str(shot["outcome"].get("name") or "")
+            team_id = ""
+            if isinstance(ev.get("team"), dict):
+                team_id = str(ev["team"].get("id") or "")
+            player_id = ""
+            if isinstance(ev.get("player"), dict):
+                player_id = str(ev["player"].get("id") or "")
+            row: Dict[str, object] = {
+                "match_id": str(match_id),
+                "team_id": team_id,
+                "player_id": player_id,
+                "x": x,
+                "y": y,
+                "body_part": body_part,
+                "technique": technique,
+                "shot_type": shot_type,
+                "first_time": bool(shot.get("first_time", False)),
+                "under_pressure": bool(ev.get("under_pressure", False)),
+                "one_on_one": bool(shot.get("one_on_one", False)),
+                "open_goal": bool(shot.get("open_goal", False)),
+                "minute": int(ev.get("minute", 0) or 0),
+                "is_goal": 1 if outcome == "Goal" else 0,
+                "statsbomb_xg": float(shot.get("statsbomb_xg", 0.0) or 0.0),
+            }
+            out.append(row)
+        return out
+
+    def shots_for_competition(
+        self,
+        competition_id: int,
+        season_id: int,
+        *,
+        match_limit: Optional[int] = None,
+    ) -> List[Dict[str, object]]:
+        """All shots across all matches in a competition/season. Pulls
+        events one match at a time, so the StatsBomb events cache benefits
+        on subsequent calls."""
+        out: List[Dict[str, object]] = []
+        matches = self.matches(competition_id, season_id)
+        if match_limit is not None:
+            matches = matches[:match_limit]
+        for m in matches:
+            try:
+                mid = int(m["match_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            rows = self.shots_for_match(mid)
+            out.extend(rows)
+        return out

@@ -8,3 +8,9 @@ from src.sports.soccer.models.player_share import PlayerShareModel  # noqa: F401
 from src.sports.soccer.models.minutes import MinutesModel  # noqa: F401
 from src.sports.soccer.models.cards import CardsModel  # noqa: F401
 from src.sports.soccer.models.state_space import StateSpaceUpdater  # noqa: F401
+from src.sports.soccer.models.xg import (  # noqa: F401
+    FEATURE_NAMES as XG_FEATURE_NAMES,
+    XgModel,
+    aggregate_match_xg,
+    extract_shot_features,
+)

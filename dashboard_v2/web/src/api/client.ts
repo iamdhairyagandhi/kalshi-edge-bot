@@ -411,6 +411,22 @@ export const api = {
                 teams: number;
                 decay_per_day: number;
               }>("/api/soccer/fit-statsbomb", body || {}),
+  soccerFitXg: (body?: {
+                competitions?: { competition_id: number; season_id: number; neutral?: boolean }[];
+                decay_per_day?: number;
+                match_limit_per_comp?: number;
+              }) => postJSON<{
+                ok: boolean;
+                fit_source: string;
+                competitions: string[];
+                matches_used: number;
+                matches_with_xg: number;
+                xg_shots_trained: number;
+                xg_goals_trained: number;
+                xg_backend: string;
+                xg_base_rate: number;
+                decay_per_day: number;
+              }>("/api/soccer/fit-xg", body || {}),
   soccerIngestOddsFixtures: () => postJSON<{
                 ok: boolean;
                 sport_key: string;

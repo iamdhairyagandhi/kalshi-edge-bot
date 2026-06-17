@@ -21,7 +21,7 @@ import logging
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import httpx
@@ -42,6 +42,7 @@ from src.sports.soccer.models.cards import CardsModel
 from src.sports.soccer.models.dixon_coles import DixonColesModel
 from src.sports.soccer.models.minutes import MinutesModel
 from src.sports.soccer.models.player_share import PlayerShareModel
+from src.sports.soccer.models.xg import XgModel, aggregate_match_xg
 from src.sports.soccer.pricing.edge import report_edge
 from src.sports.soccer.ratings.elo import EloTable
 from src.sports.soccer.simulator.bet_builder import price_bet_builder
@@ -292,6 +293,12 @@ class FitFromStatsBombIn(BaseModel):
     decay_per_day: Optional[float] = None
 
 
+class FitXgFromStatsBombIn(BaseModel):
+    competitions: Optional[List[StatsBombCompetitionIn]] = None
+    decay_per_day: Optional[float] = None
+    match_limit_per_comp: Optional[int] = None
+
+
 class OddsFixtureIngestOut(BaseModel):
     ok: bool
     sport_key: str
@@ -334,10 +341,52 @@ class SoccerEngine:
         # after the resolution loop writes new outcomes.
         self.calibration = CalibrationLayer()
         self.calibration_fitted_at_unix: Optional[int] = None
+        # Shot-level xG model. When fitted, per-match xG totals replace
+        # raw historical goal counts as the Dixon-Coles fit target.
+        self.xg_model: Optional[XgModel] = None
+        self.xg_fitted_at_unix: Optional[int] = None
+        self.xg_match_count: int = 0
+        self.xg_shot_count: int = 0
+        self.use_xg_targets: bool = True
 
     # --------------------------------------------------------------
     def is_ready(self) -> bool:
         return self.score_model is not None and len(self.squads) > 0
+
+    # --------------------------------------------------------------
+    def _apply_xg_targets(
+        self,
+        matches: List[Dict[str, object]],
+    ) -> Tuple[List[Dict[str, object]], int]:
+        """Return a copy of `matches` where `home_goals`/`away_goals` are
+        replaced with `round(home_xg/away_xg)` for rows that carry xG
+        columns. Used as the lower-variance DC fit target.
+
+        Returns `(matches_out, n_replaced)`. When xG targeting is disabled
+        (`self.use_xg_targets = False`) the input is returned unchanged.
+        """
+        if not self.use_xg_targets:
+            return matches, 0
+        out: List[Dict[str, object]] = []
+        n_replaced = 0
+        for m in matches:
+            hxg = m.get("home_xg")
+            axg = m.get("away_xg")
+            if hxg is not None and axg is not None:
+                try:
+                    hxg_f = float(hxg)
+                    axg_f = float(axg)
+                except (TypeError, ValueError):
+                    out.append(m)
+                    continue
+                copy = dict(m)
+                copy["home_goals"] = int(round(hxg_f))
+                copy["away_goals"] = int(round(axg_f))
+                out.append(copy)
+                n_replaced += 1
+            else:
+                out.append(m)
+        return out, n_replaced
 
     # --------------------------------------------------------------
     def ensure_ready_from_store(self) -> bool:
@@ -369,9 +418,13 @@ class SoccerEngine:
         decay_per_day: float,
     ) -> None:
         self.team_names = {tid: meta["name"] for tid, meta in team_lookup.items()}
+        # Elo always fits to *actual* match outcomes (it is a result-based
+        # rating, not a strength estimator). xG only feeds Dixon-Coles.
         self.elo = EloTable()
         self.elo.fit(matches)
-        self.score_model = DixonColesModel.fit(matches, decay_per_day=decay_per_day)
+        dc_matches, n_xg_used = self._apply_xg_targets(matches)
+        self.score_model = DixonColesModel.fit(dc_matches, decay_per_day=decay_per_day)
+        self.xg_match_count = n_xg_used
 
         squads_seed: Dict[str, List[Dict[str, str]]] = {}
         for tid, meta in team_lookup.items():
@@ -661,17 +714,147 @@ class SoccerEngine:
             ))
         self.store.upsert_teams(teams_now, now_unix=int(time.time()))
 
-        self._fit_models(all_matches, team_lookup, decay_per_day=decay)
+        # Re-read from store so any previously-computed xG columns are
+        # picked up. This means a fit-statsbomb call after fit-xg will
+        # automatically use the xG-derived targets without re-running
+        # the shot model.
+        stored_matches = self.store.historical_matches()
+        merged = stored_matches if stored_matches else all_matches
+        self._fit_models(merged, team_lookup, decay_per_day=decay)
 
         self.fitted_at_unix = int(time.time())
-        self.fit_source = "statsbomb"
+        self.fit_source = "statsbomb+xg" if self.xg_match_count > 0 else "statsbomb"
         deleted_synthetic_fixtures = self.store.delete_synthetic_fixtures()
         self.refit_calibration()
 
         return {
             "competitions": sources,
-            "matches_used": len(all_matches),
+            "matches_used": len(merged),
             "teams": len(team_lookup),
+            "decay_per_day": decay,
+            "deleted_synthetic_fixtures": deleted_synthetic_fixtures,
+            "xg_matches_applied": self.xg_match_count,
+        }
+
+    # --------------------------------------------------------------
+    def fit_xg_from_statsbomb(
+        self,
+        competitions: List[Dict[str, int]],
+        *,
+        cache_dir: Optional[str] = None,
+        decay_per_day: Optional[float] = None,
+        match_limit_per_comp: Optional[int] = None,
+    ) -> Dict[str, object]:
+        """Pull shot events for the requested competitions, train an xG
+        model on them, compute per-match home/away xG totals, persist to
+        the store, and refit Dixon-Coles using the xG-derived targets.
+
+        Each entry: {"competition_id": int, "season_id": int, "neutral": bool}.
+
+        Pulling events is expensive (one HTTP request per match, typically
+        50-200KB each). Use `match_limit_per_comp` to cap for smoke tests.
+        Subsequent calls are cheap thanks to the StatsBomb file cache.
+        """
+        cdir = cache_dir or settings.soccer_data_cache_dir
+        decay = decay_per_day if decay_per_day is not None else settings.soccer_decay_per_day
+
+        all_shots: List[Dict[str, object]] = []
+        match_home_away: Dict[str, Tuple[str, str]] = {}
+        team_lookup: Dict[str, Dict[str, str]] = {}
+        sources: List[str] = []
+        all_matches: List[Dict[str, object]] = []
+
+        with StatsBombOpenData(cache_dir=cdir) as sb:
+            for entry in competitions:
+                cid = int(entry["competition_id"])
+                sid = int(entry["season_id"])
+                neutral = bool(entry.get("neutral", True))
+                rows = sb.matches_for_dixon_coles(cid, sid, neutral_default=neutral)
+                if not rows:
+                    continue
+                sources.append(
+                    f"{cid}/{sid} ({rows[0].get('competition','?')} {rows[0].get('season','?')})"
+                )
+                if match_limit_per_comp is not None:
+                    rows = rows[:match_limit_per_comp]
+                for r in rows:
+                    all_matches.append(r)
+                    h_id = str(r["home_team_id"])
+                    a_id = str(r["away_team_id"])
+                    mid = str(r.get("match_id") or "")
+                    if mid:
+                        match_home_away[mid] = (h_id, a_id)
+                    team_lookup.setdefault(h_id, {
+                        "name": str(r.get("home_team_name") or h_id),
+                        "country": str(r.get("home_country") or ""),
+                    })
+                    team_lookup.setdefault(a_id, {
+                        "name": str(r.get("away_team_name") or a_id),
+                        "country": str(r.get("away_country") or ""),
+                    })
+                    # Pull shots for this match
+                    try:
+                        match_id_int = int(r["match_id"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    shots = sb.shots_for_match(match_id_int)
+                    all_shots.extend(shots)
+
+        if not all_matches:
+            raise RuntimeError("statsbomb returned no matches for the requested competitions")
+        if not all_shots:
+            raise RuntimeError("statsbomb returned no shot events for the requested competitions")
+
+        # Persist matches + teams so a fresh DB has the baseline rows to
+        # update xG into.
+        self.store.upsert_historical_matches(all_matches)
+        teams_now = []
+        for tid, meta in team_lookup.items():
+            teams_now.append(Team(
+                team_id=tid,
+                name=meta["name"],
+                country=meta["country"] or None,
+                elo=1500.0,
+                attack=0.0,
+                defense=0.0,
+            ))
+        self.store.upsert_teams(teams_now, now_unix=int(time.time()))
+
+        # Train the xG model on all shots.
+        self.xg_model = XgModel.fit(all_shots)
+        self.xg_shot_count = len(all_shots)
+        self.xg_fitted_at_unix = int(time.time())
+
+        # Aggregate per-match xG and persist.
+        per_match = aggregate_match_xg(
+            all_shots, self.xg_model, match_home_away=match_home_away,
+        )
+        xg_rows = [
+            {"match_id": mid, "home_xg": hxg, "away_xg": axg}
+            for mid, (hxg, axg) in per_match.items()
+        ]
+        self.store.upsert_match_xg(xg_rows)
+
+        # Re-read matches from store so DC fits on the freshly-written xG.
+        stored_matches = self.store.historical_matches()
+        merged = stored_matches if stored_matches else all_matches
+        self._fit_models(merged, team_lookup, decay_per_day=decay)
+
+        self.fitted_at_unix = int(time.time())
+        self.fit_source = "statsbomb+xg"
+        deleted_synthetic_fixtures = self.store.delete_synthetic_fixtures()
+        self.refit_calibration()
+
+        coverage = self.store.historical_matches_xg_coverage()
+
+        return {
+            "competitions": sources,
+            "matches_used": len(merged),
+            "matches_with_xg": coverage["with_xg"],
+            "xg_shots_trained": self.xg_model.n_shots_trained,
+            "xg_goals_trained": self.xg_model.n_goals_trained,
+            "xg_backend": self.xg_model.backend,
+            "xg_base_rate": round(self.xg_model.base_rate, 4),
             "decay_per_day": decay,
             "deleted_synthetic_fixtures": deleted_synthetic_fixtures,
         }
@@ -772,6 +955,37 @@ def fit_statsbomb(
         info = eng.fit_from_statsbomb(
             comps,
             decay_per_day=(body.decay_per_day if body is not None else None),
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=f"statsbomb_fetch_failed: {e}") from e
+    return {"ok": True, "fit_source": eng.fit_source, **info}
+
+
+@router.post("/soccer/fit-xg")
+def fit_xg(
+    request: Request,
+    body: Optional[FitXgFromStatsBombIn] = Body(default=None),
+) -> Dict[str, object]:
+    """Train the shot-level xG model on StatsBomb open-data, persist
+    per-match home/away xG totals into the store, then refit Dixon-Coles
+    using xG as the goal-rate target (lower variance than raw goal counts).
+
+    This is the P0-4 deliverable: real xG replaces actual historical
+    goals as the DC fit target. Subsequent /fit-statsbomb calls will
+    automatically pick up the persisted xG columns from the store, so
+    you only need to run /fit-xg once per dataset refresh.
+    """
+    eng = _engine(request)
+    comps: List[Dict[str, object]]
+    if body is not None and body.competitions:
+        comps = [c.model_dump() for c in body.competitions]
+    else:
+        comps = list(_DEFAULT_STATSBOMB_COMPS)
+    try:
+        info = eng.fit_xg_from_statsbomb(
+            comps,
+            decay_per_day=(body.decay_per_day if body is not None else None),
+            match_limit_per_comp=(body.match_limit_per_comp if body is not None else None),
         )
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=f"statsbomb_fetch_failed: {e}") from e

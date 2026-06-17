@@ -8,6 +8,7 @@ type Props = {
   empty: boolean;
   onSeedDemo: () => void;
   onFitReal: () => void;
+  onFitXg: () => void;
   onLoadOddsFixtures: () => void;
   fitting: boolean;
   fitInfo: string | null;
@@ -28,7 +29,7 @@ function fmtTime(unix: number): string {
 }
 
 export default function FixturesPanel({
-  fixtures, selectedId, onSelect, empty, onSeedDemo, onFitReal, onLoadOddsFixtures, fitting, fitInfo, seedError, onResolved,
+  fixtures, selectedId, onSelect, empty, onSeedDemo, onFitReal, onFitXg, onLoadOddsFixtures, fitting, fitInfo, seedError, onResolved,
 }: Props) {
   return (
     <div className="panel">
@@ -57,6 +58,18 @@ export default function FixturesPanel({
               >{fitting ? "FETCHING…" : "FIT REAL DATA (WC18/WC22/EURO20/EURO24)"}</button>
               <button
                 disabled={fitting}
+                onClick={onFitXg}
+                style={{
+                  background: "rgba(180,120,255,0.18)", color: "#cda5ff",
+                  border: "1px solid rgba(180,120,255,0.45)",
+                  padding: "4px 12px", borderRadius: 2, fontFamily: "var(--mono)",
+                  fontSize: 11, cursor: fitting ? "wait" : "pointer", letterSpacing: "0.1em",
+                  opacity: fitting ? 0.5 : 1,
+                }}
+                title="Train shot-level xG model on StatsBomb open-data and refit Dixon-Coles with xG-derived targets (lower variance than raw goals)."
+              >{fitting ? "TRAINING…" : "FIT xG MODEL"}</button>
+              <button
+                disabled={fitting}
                 onClick={onLoadOddsFixtures}
                 style={{
                   background: "rgba(255,180,40,0.18)", color: "var(--amber)",
@@ -82,7 +95,10 @@ export default function FixturesPanel({
             <span className="dim" style={{ fontSize: 11 }}>
               <strong>FIT REAL DATA</strong> pulls 230 matches from StatsBomb's open-data
               (WC 2018, WC 2022, Euro 2020, Euro 2024) and refits Dixon-Coles + Elo on real results.
-              It does not create fixtures. <strong>LOAD REAL FIXTURES</strong> uses The Odds API and only
+              It does not create fixtures. <strong>FIT xG MODEL</strong> additionally trains a
+              shot-level Expected-Goals model on the same dataset and uses xG totals (instead of
+              raw goals) as the DC fit target — far less noisy on small samples.
+              <strong> LOAD REAL FIXTURES</strong> uses The Odds API and only
               inserts events whose teams match the fitted model. <strong>SEED DEMO</strong> is synthetic.
             </span>
           </div>

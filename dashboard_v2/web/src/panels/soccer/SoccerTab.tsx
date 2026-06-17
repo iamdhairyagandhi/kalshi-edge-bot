@@ -64,6 +64,22 @@ export default function SoccerTab() {
     }
   }
 
+  async function fitXg() {
+    setSeedingError(null);
+    setFitting(true);
+    try {
+      const r = await api.soccerFitXg();
+      setFitInfo(
+        `xG · ${r.xg_shots_trained} shots · ${r.matches_with_xg} matches (${r.xg_backend})`,
+      );
+      await refreshFixtures();
+    } catch (e: any) {
+      setSeedingError(String(e));
+    } finally {
+      setFitting(false);
+    }
+  }
+
   async function loadOddsFixtures() {
     setSeedingError(null);
     setFitting(true);
@@ -131,6 +147,7 @@ export default function SoccerTab() {
           empty={empty}
           onSeedDemo={seedDemo}
           onFitReal={fitReal}
+          onFitXg={fitXg}
           onLoadOddsFixtures={loadOddsFixtures}
           fitting={fitting}
           fitInfo={fitInfo}

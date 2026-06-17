@@ -132,6 +132,17 @@ class SoccerStore:
     def _init_schema(self) -> None:
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            # Idempotent migrations for columns added after the initial
+            # schema was deployed. SQLite raises OperationalError if the
+            # column already exists; we swallow that.
+            for ddl in (
+                "ALTER TABLE historical_matches ADD COLUMN home_xg REAL",
+                "ALTER TABLE historical_matches ADD COLUMN away_xg REAL",
+            ):
+                try:
+                    c.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass
 
     # ------------------------------------------------------------------
     # writes
@@ -427,3 +438,61 @@ class SoccerStore:
         with self._conn() as c:
             row = c.execute("SELECT COUNT(*) AS n FROM historical_matches").fetchone()
             return int(row["n"]) if row else 0
+
+    def delete_synthetic_fixtures(self) -> int:
+        """Delete the demo/synthetic fixtures seeded by `seed_demo`.
+
+        Called after a real-data fit so the dashboard is no longer cluttered
+        with demo-* placeholder games whose team IDs may not exist in the
+        real-data team table. Returns the number of rows deleted.
+        """
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM fixtures WHERE id LIKE 'demo-%'")
+            return int(cur.rowcount or 0)
+
+    def upsert_match_xg(
+        self, rows: Iterable[Mapping[str, object]]
+    ) -> int:
+        """Update home_xg / away_xg for existing historical_matches rows.
+
+        Each row must carry `match_id` (or `id`) plus `home_xg`, `away_xg`.
+        Rows whose match_id does not exist in the table are silently ignored
+        (UPDATE with zero rows affected). Returns the number of UPDATE
+        statements issued (not the number of rows actually changed).
+        """
+        payload = []
+        for r in rows:
+            mid = str(r.get("match_id") or r.get("id") or "")
+            if not mid:
+                continue
+            try:
+                hxg = float(r["home_xg"])
+                axg = float(r["away_xg"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            payload.append((hxg, axg, mid))
+        if not payload:
+            return 0
+        with self._conn() as c:
+            c.executemany(
+                """UPDATE historical_matches
+                      SET home_xg = ?, away_xg = ?
+                    WHERE id = ?""",
+                payload,
+            )
+        return len(payload)
+
+    def historical_matches_xg_coverage(self) -> dict:
+        """Return {total, with_xg, missing_xg} for monitoring."""
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT
+                      COUNT(*)                                  AS total,
+                      SUM(CASE WHEN home_xg IS NOT NULL
+                                AND away_xg IS NOT NULL
+                               THEN 1 ELSE 0 END)               AS with_xg
+                     FROM historical_matches"""
+            ).fetchone()
+            total = int(row["total"]) if row else 0
+            with_xg = int(row["with_xg"] or 0) if row else 0
+        return {"total": total, "with_xg": with_xg, "missing_xg": total - with_xg}
