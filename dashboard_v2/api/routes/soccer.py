@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 
 from src.config import settings
 from src.sports.soccer.calibration.isotonic import (
+    CalibrationLayer,
     PredictionRecord,
     brier_score,
     reliability_buckets,
@@ -298,6 +299,11 @@ class SoccerEngine:
         self.player_names: Dict[str, str] = {}
         self.fitted_at_unix: Optional[int] = None
         self.fit_source: str = "uninitialized"
+        # Per-market isotonic calibration. Identity by default; fit from
+        # resolved predictions whenever the model is (re)fit, and again
+        # after the resolution loop writes new outcomes.
+        self.calibration = CalibrationLayer()
+        self.calibration_fitted_at_unix: Optional[int] = None
 
     # --------------------------------------------------------------
     def is_ready(self) -> bool:
@@ -321,6 +327,7 @@ class SoccerEngine:
         self._fit_models(matches, team_lookup, decay_per_day=settings.soccer_decay_per_day)
         self.fitted_at_unix = int(time.time())
         self.fit_source = "store"
+        self.refit_calibration()
         return True
 
     # --------------------------------------------------------------
@@ -360,6 +367,90 @@ class SoccerEngine:
         self.cards = CardsModel.from_priors(
             {pid: {"yellow_per90": 0.20, "red_per90": 0.005} for pid in all_pids},
         )
+
+    # --------------------------------------------------------------
+    def refit_calibration(self) -> int:
+        """Refit the per-market isotonic calibration from resolved
+        predictions in the store. Safe to call with zero records — the
+        layer simply stays identity until each market accumulates ≥30
+        resolved samples. Returns the count of resolved records read."""
+        try:
+            rows = self.store.predictions_resolved()
+        except Exception:
+            return 0
+        records: List[PredictionRecord] = []
+        for r in rows:
+            try:
+                records.append(PredictionRecord(
+                    market_type=str(r["market_type"]),
+                    fair_probability=float(r["fair_probability"]),
+                    book_decimal_odds=r.get("book_decimal_odds"),
+                    pinnacle_close_decimal=r.get("pinnacle_close_decimal"),
+                    outcome=int(r["outcome"]) if r.get("outcome") is not None else None,
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
+        self.calibration = CalibrationLayer()
+        if records:
+            try:
+                self.calibration.fit(records)
+            except Exception as exc:  # pragma: no cover
+                _LOG.warning("calibration fit failed: %s", exc)
+        self.calibration_fitted_at_unix = int(time.time())
+        return len(records)
+
+    # --------------------------------------------------------------
+    def calibrate_market(self, market_type: str, p: float) -> float:
+        """Apply the per-market isotonic calibration to a single
+        probability. Returns p unchanged if the market hasn't been
+        fitted yet (insufficient resolved samples)."""
+        try:
+            q = self.calibration.calibrate(market_type, float(p))
+        except Exception:
+            return float(p)
+        if q != q or q <= 0.0 or q >= 1.0:  # NaN guard + clip
+            return float(min(max(p, 1e-6), 1.0 - 1e-6))
+        return float(q)
+
+    # --------------------------------------------------------------
+    # Canonical market_type strings — must match what the resolution
+    # loop writes to predictions.market_type so the isotonic mapping
+    # actually applies.
+    _CALIBRATE_KEYS = (
+        "home_win", "draw", "away_win",
+        "over_2_5", "under_2_5",
+        "over_1_5", "under_1_5",
+        "over_3_5", "under_3_5",
+        "btts_yes", "btts_no",
+    )
+
+    def calibrate_probs(self, probs: Dict[str, float]) -> Dict[str, float]:
+        """Calibrate every recognised key in a probs dict and renormalise
+        complementary 2-/3-way buckets so they still sum to ~1. Unknown
+        keys are passed through untouched."""
+        if not probs:
+            return probs
+        out: Dict[str, float] = dict(probs)
+        for k in self._CALIBRATE_KEYS:
+            if k in out and out[k] is not None:
+                out[k] = self.calibrate_market(k, float(out[k]))
+        # Renormalise the canonical complementary buckets.
+        for bucket in (
+            ("home_win", "draw", "away_win"),
+            ("over_2_5", "under_2_5"),
+            ("over_1_5", "under_1_5"),
+            ("over_3_5", "under_3_5"),
+            ("btts_yes", "btts_no"),
+        ):
+            present = [k for k in bucket if k in out and out[k] is not None]
+            if len(present) < 2:
+                continue
+            s = sum(float(out[k]) for k in present)
+            if s <= 0:
+                continue
+            for k in present:
+                out[k] = float(out[k]) / s
+        return out
 
     # --------------------------------------------------------------
     def seed_demo(self) -> Dict[str, object]:
@@ -481,6 +572,7 @@ class SoccerEngine:
         self.store.upsert_fixtures(fixtures)
         self.fitted_at_unix = int(time.time())
         self.fit_source = "demo"
+        self.refit_calibration()
         return {"teams": len(self.team_names), "fixtures": len(fixtures), "matches_used": len(matches)}
 
     # --------------------------------------------------------------
@@ -544,6 +636,7 @@ class SoccerEngine:
         self.fitted_at_unix = int(time.time())
         self.fit_source = "statsbomb"
         deleted_synthetic_fixtures = self.store.delete_synthetic_fixtures()
+        self.refit_calibration()
 
         return {
             "competitions": sources,
@@ -702,6 +795,7 @@ def fixtures(request: Request, since_unix: Optional[int] = None, limit: int = 50
                     r["home_team_id"], r["away_team_id"],
                     neutral=bool(r["neutral_venue"]),
                 )
+                probs = eng.calibrate_probs(probs)
             except KeyError:
                 probs = {}
         out.append(FixtureOut(
@@ -739,6 +833,7 @@ def match_summary(request: Request, fixture_id: str, n_sims: int = 5000) -> Matc
     assert eng.score_model is not None
     sm = eng.score_model.score_matrix(home_id, away_id, neutral=neutral, max_goals=8)
     outcome = eng.score_model.outcome_probs(home_id, away_id, neutral=neutral, max_goals=8)
+    outcome = eng.calibrate_probs(outcome)
     sim = eng.simulator()
     sims = sim.simulate(home_id, away_id, neutral_venue=neutral,
                         config=SimulationConfig(n_sims=int(n_sims), seed=hash(fixture_id) & 0xFFFFFFFF))
@@ -799,6 +894,7 @@ def edge_board(request: Request, fixture_id: str, n_sims: int = 8000) -> SoccerE
     away = eng.team_names.get(away_id, away_id)
     assert eng.score_model is not None
     probs = eng.score_model.outcome_probs(home_id, away_id, neutral=neutral, max_goals=10)
+    probs = eng.calibrate_probs(probs)
     lam_h, lam_a = eng.score_model.params.lambdas(home_id, away_id, neutral=neutral)
 
     event: Optional[Dict[str, object]] = None
@@ -1378,6 +1474,7 @@ def _betslips_for_fixture(
     away = eng.team_names.get(away_id, away_id)
     match_label = f"{home} vs {away}"
     probs = eng.score_model.outcome_probs(home_id, away_id, neutral=neutral, max_goals=10)
+    probs = eng.calibrate_probs(probs)
     event = _find_odds_event(events, fixture, home, away)
     slips: List[SoccerBetslipOut] = []
 
