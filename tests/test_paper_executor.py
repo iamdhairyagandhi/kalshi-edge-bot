@@ -1,6 +1,7 @@
 """Tests for the paper executor."""
 
 import os
+import sqlite3
 import tempfile
 
 import pytest
@@ -92,3 +93,61 @@ def test_sell_more_than_held_raises(executor):
     with pytest.raises(ValueError, match="Selling more"):
         executor.execute_leg(strategy="t", ticker="K1", side="YES",
                              action="sell", contracts=10, price=0.60)
+
+
+def test_executor_hydrates_portfolio_from_trade_log_after_restart():
+    with tempfile.TemporaryDirectory() as d:
+        db = os.path.join(d, "paper.db")
+        ex = PaperExecutor(db, starting_bankroll=1000.0)
+        ex.execute_leg(
+            strategy="t", ticker="K1", side="YES",
+            action="buy", contracts=10, price=0.40, is_maker=True,
+        )
+        ex.execute_leg(
+            strategy="t", ticker="K1", side="YES",
+            action="sell", contracts=4, price=0.60, is_maker=True,
+        )
+
+        restarted = PaperExecutor(db, starting_bankroll=1000.0)
+        pos = restarted.portfolio.positions["kalshi:K1:YES"]
+        assert pos.contracts == 6
+        assert pos.avg_price == pytest.approx(0.40)
+        assert restarted.portfolio.realized_pnl == pytest.approx(0.80)
+        assert restarted.portfolio.cash == pytest.approx(998.40)
+
+
+def test_executor_rebuilds_paper_positions_snapshot():
+    with tempfile.TemporaryDirectory() as d:
+        db = os.path.join(d, "paper.db")
+        ex = PaperExecutor(db, starting_bankroll=1000.0)
+        ex.execute_leg(
+            strategy="t", ticker="K1", side="YES",
+            action="buy", contracts=10, price=0.40, is_maker=True,
+        )
+        ex.execute_leg(
+            strategy="t", ticker="K2", side="NO",
+            action="buy", contracts=3, price=0.20, is_maker=True,
+        )
+        ex.execute_leg(
+            strategy="t", ticker="K1", side="YES",
+            action="sell", contracts=10, price=0.60, is_maker=True,
+        )
+
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT venue, ticker, side, contracts, closed_at, realized_pnl "
+                "FROM paper_positions ORDER BY ticker"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 2
+        assert rows[0]["ticker"] == "K1"
+        assert rows[0]["contracts"] == 0
+        assert rows[0]["closed_at"] is not None
+        assert rows[0]["realized_pnl"] == pytest.approx(2.0)
+        assert rows[1]["ticker"] == "K2"
+        assert rows[1]["contracts"] == 3
+        assert rows[1]["closed_at"] is None

@@ -1,7 +1,7 @@
 import { useStore } from "../store";
 
 const fmt = (n: number | null | undefined, d = 2) =>
-  n == null ? "—" : n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+  n == null ? "—" : Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
 
 export default function TopBar() {
   const { venue, setVenue, wsAlive, portfolio } = useStore();
@@ -23,6 +23,14 @@ export default function TopBar() {
       <div className="stat">
         <span>Cash</span>
         <span className="value mono">${fmt(portfolio?.cash)}</span>
+      </div>
+      <div className="stat">
+        <span>Deployed</span>
+        <span className="value mono">${fmt(portfolio?.open_position_cost)}</span>
+      </div>
+      <div className="stat">
+        <span>Fees</span>
+        <span className="value mono down">-${fmt(portfolio?.fees_paid)}</span>
       </div>
       <div className="stat">
         <span>Open</span>

@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from typing import List, Optional
 
 from src.clients.kalshi import KalshiClient
 from src.config import settings
+from src.jobs.diagnostics import TradeDiagnostic, record_diagnostics
 from src.paper.executor import PaperExecutor
 from src.risk.gates import GateConfig, derive_event_family, evaluate_gates
 from src.risk.invariants import (
@@ -29,11 +31,15 @@ from src.risk.invariants import (
 from src.strategies.overround_arb import (
     ArbOpportunity, Orderbook, scan_orderbooks,
 )
-from src.utils.fees import kelly_fraction
+from src.utils.fees import taker_fee
 from src.utils.orderbook_parser import parse_orderbook
 
 
 logger = logging.getLogger(__name__)
+
+
+def _market_title(market: dict) -> str:
+    return str(market.get("title") or market.get("yes_sub_title") or market.get("ticker") or "")
 
 
 async def fetch_open_markets(client: KalshiClient, max_markets: int) -> List[dict]:
@@ -129,11 +135,83 @@ def filter_and_execute(
     return executed
 
 
+def _near_miss_diagnostics(
+    books: List[Orderbook],
+    markets_by_ticker: dict,
+    *,
+    min_net_edge_per_contract: float,
+    safety_margin: float,
+    limit: int = 10,
+) -> List[TradeDiagnostic]:
+    rows: List[TradeDiagnostic] = []
+    scored: List[tuple[float, TradeDiagnostic]] = []
+    for book in books:
+        candidates = []
+        contracts = min(book.yes_best_ask_size, book.no_best_ask_size, 50)
+        if contracts > 0:
+            fees = taker_fee(contracts, book.yes_best_ask) + taker_fee(contracts, book.no_best_ask)
+            net = 1.0 - (book.yes_best_ask + book.no_best_ask) - (fees / contracts) - safety_margin
+            candidates.append(("buy_both", net, book.yes_best_ask + book.no_best_ask))
+        contracts = min(book.yes_best_bid_size, book.no_best_bid_size, 50)
+        if contracts > 0:
+            fees = taker_fee(contracts, book.yes_best_bid) + taker_fee(contracts, book.no_best_bid)
+            net = (book.yes_best_bid + book.no_best_bid) - 1.0 - (fees / contracts) - safety_margin
+            candidates.append(("sell_both", net, book.yes_best_bid + book.no_best_bid))
+        if not candidates:
+            market = markets_by_ticker.get(book.ticker, {})
+            scored.append((
+                999.0,
+                TradeDiagnostic(
+                    strategy="overround_arb",
+                    venue="kalshi",
+                    market_id=book.ticker,
+                    market_title=_market_title(market),
+                    decision="blocked",
+                    reason="insufficient_two_sided_depth",
+                    metric_name="two_sided_depth",
+                    metric_value=0.0,
+                    threshold_value=1.0,
+                    details=(
+                        f"yes_bid_size={book.yes_best_bid_size} no_bid_size={book.no_best_bid_size} "
+                        f"yes_ask_size={book.yes_best_ask_size} no_ask_size={book.no_best_ask_size}"
+                    ),
+                ),
+            ))
+            continue
+        side, net_edge, observed = max(candidates, key=lambda x: x[1])
+        if net_edge >= min_net_edge_per_contract:
+            continue
+        gap = min_net_edge_per_contract - net_edge
+        market = markets_by_ticker.get(book.ticker, {})
+        scored.append((
+            gap,
+            TradeDiagnostic(
+                strategy="overround_arb",
+                venue="kalshi",
+                market_id=book.ticker,
+                market_title=_market_title(market),
+                side=side,
+                decision="near_miss",
+                reason="edge_below_threshold",
+                metric_name="net_edge_per_contract",
+                metric_value=net_edge,
+                threshold_value=min_net_edge_per_contract,
+                observed_price=observed,
+                details=f"gap={gap:.4f} safety_margin={safety_margin:.4f}",
+            ),
+        ))
+    scored.sort(key=lambda x: x[0])
+    rows.extend(row for _, row in scored[:limit])
+    return rows
+
+
 async def run_once(
     client: KalshiClient,
     executor: PaperExecutor,
     max_markets: int,
     gate_config: Optional[GateConfig] = None,
+    min_net_edge_per_contract: Optional[float] = None,
+    safety_margin: Optional[float] = None,
 ) -> dict:
     """Single scan pass. Returns summary stats."""
     # Invariant check on portfolio state BEFORE we do anything
@@ -155,8 +233,35 @@ async def run_once(
     books = await fetch_orderbooks(client, tickers)
     logger.info("Got %d non-empty orderbooks", len(books))
 
-    opps = scan_orderbooks(books)
+    min_edge = (
+        settings.kalshi_arb_min_net_edge
+        if min_net_edge_per_contract is None
+        else min_net_edge_per_contract
+    )
+    margin = (
+        settings.kalshi_arb_safety_margin
+        if safety_margin is None
+        else safety_margin
+    )
+    opps = scan_orderbooks(
+        books,
+        min_net_edge_per_contract=min_edge,
+        safety_margin=margin,
+    )
     logger.info("Found %d arb opportunities", len(opps))
+
+    try:
+        record_diagnostics(
+            executor.db_path,
+            _near_miss_diagnostics(
+                books,
+                markets_by_ticker,
+                min_net_edge_per_contract=min_edge,
+                safety_margin=margin,
+            ),
+        )
+    except sqlite3.Error as e:
+        logger.warning("trade diagnostics write failed: %s", e)
 
     executed = filter_and_execute(opps, executor, markets_by_ticker, gate_config)
 
@@ -171,7 +276,13 @@ async def run_once(
     }
 
 
-async def run_loop(stop_after_iterations: Optional[int] = None) -> None:
+async def run_loop(
+    stop_after_iterations: Optional[int] = None,
+    *,
+    max_markets: Optional[int] = None,
+    min_net_edge_per_contract: Optional[float] = None,
+    safety_margin: Optional[float] = None,
+) -> None:
     client = KalshiClient()
     executor = PaperExecutor(settings.db_path, settings.starting_bankroll)
     logger.info(
@@ -182,7 +293,13 @@ async def run_loop(stop_after_iterations: Optional[int] = None) -> None:
     try:
         while True:
             try:
-                summary = await run_once(client, executor, settings.max_markets_per_scan)
+                summary = await run_once(
+                    client,
+                    executor,
+                    max_markets or settings.max_markets_per_scan,
+                    min_net_edge_per_contract=min_net_edge_per_contract,
+                    safety_margin=safety_margin,
+                )
                 logger.info("SUMMARY %s", summary)
             except InvariantViolation as e:
                 # HARD STOP. Bot state is corrupted; do not continue trading.

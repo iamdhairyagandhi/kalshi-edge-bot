@@ -184,6 +184,12 @@ class KalshiClient:
         if tickers: params["tickers"] = ",".join(tickers)
         return await self._request("GET", "/trade-api/v2/markets", params=params, require_auth=False)
 
+    async def get_series(self, limit: int = 200, cursor: Optional[str] = None) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request("GET", "/trade-api/v2/series", params=params, require_auth=False)
+
     async def get_orderbook(self, ticker: str, depth: int = 10) -> Dict[str, Any]:
         return await self._request(
             "GET", f"/trade-api/v2/markets/{ticker}/orderbook",

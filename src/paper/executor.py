@@ -148,6 +148,8 @@ class PaperExecutor:
             # that reference the venue column.
             run_migrations(c)
             c.executescript(SCHEMA)
+            self._hydrate_portfolio(c)
+            self._rebuild_positions_table(c)
 
     def _fee_model_for(self, venue: str) -> FeeModel:
         v = venue.lower()
@@ -167,6 +169,168 @@ class PaperExecutor:
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    def _hydrate_portfolio(self, conn: sqlite3.Connection) -> None:
+        """Restore cash, open positions, and realized P&L from paper_trades."""
+        self.portfolio = PaperPortfolio(
+            starting_bankroll=self.portfolio.starting_bankroll,
+            cash=self.portfolio.starting_bankroll,
+        )
+        rows = conn.execute(
+            """SELECT placed_at, venue, ticker, side, action, contracts, price, fees
+               FROM paper_trades ORDER BY id ASC"""
+        ).fetchall()
+        if not rows:
+            legacy_positions = conn.execute(
+                """SELECT venue, ticker, side, contracts, avg_price, opened_at, realized_pnl
+                   FROM paper_positions WHERE closed_at IS NULL"""
+            ).fetchall()
+            for r in legacy_positions:
+                venue = (r["venue"] if "venue" in r.keys() else "kalshi").lower()
+                pos = PaperPosition(
+                    ticker=r["ticker"],
+                    side=str(r["side"]).upper(),
+                    contracts=int(r["contracts"]),
+                    avg_price=float(r["avg_price"]),
+                    opened_at=r["opened_at"],
+                    venue=venue,
+                )
+                self.portfolio.positions[pos.key] = pos
+                self.portfolio.cash -= pos.cost
+                self.portfolio.realized_pnl += float(r["realized_pnl"] or 0.0)
+            return
+
+        for r in rows:
+            venue = str(r["venue"] or "kalshi").lower()
+            ticker = str(r["ticker"])
+            side = str(r["side"]).upper()
+            action = str(r["action"]).lower()
+            contracts = int(r["contracts"])
+            price = float(r["price"])
+            fees = float(r["fees"] or 0.0)
+            cost = contracts * price
+            key = position_key(venue, ticker, side)
+
+            if action == "buy":
+                self.portfolio.cash -= cost + fees
+                existing = self.portfolio.positions.get(key)
+                if existing is None:
+                    self.portfolio.positions[key] = PaperPosition(
+                        ticker=ticker,
+                        side=side,
+                        contracts=contracts,
+                        avg_price=price,
+                        opened_at=r["placed_at"],
+                        venue=venue,
+                    )
+                else:
+                    total_contracts = existing.contracts + contracts
+                    existing.avg_price = (
+                        (existing.avg_price * existing.contracts) + cost
+                    ) / total_contracts
+                    existing.contracts = total_contracts
+            elif action == "sell":
+                existing = self.portfolio.positions.get(key)
+                if existing is None:
+                    continue
+                sell_contracts = min(contracts, existing.contracts)
+                self.portfolio.cash += cost - fees
+                self.portfolio.realized_pnl += (
+                    (price - existing.avg_price) * sell_contracts - fees
+                )
+                existing.contracts -= sell_contracts
+                if existing.contracts <= 0:
+                    del self.portfolio.positions[key]
+
+    def _rebuild_positions_table(self, conn: sqlite3.Connection) -> None:
+        """Rebuild paper_positions from paper_trades for legacy readers."""
+        rows = conn.execute(
+            """SELECT placed_at, venue, ticker, side, action, contracts, price, fees, notes
+               FROM paper_trades ORDER BY id ASC"""
+        ).fetchall()
+        if not rows:
+            return
+
+        conn.execute("DELETE FROM paper_positions")
+        open_positions: Dict[str, PaperPosition] = {}
+        realized_by_key: Dict[str, float] = {}
+        notes_by_key: Dict[str, Optional[str]] = {}
+
+        for r in rows:
+            venue = str(r["venue"] or "kalshi").lower()
+            ticker = str(r["ticker"])
+            side = str(r["side"]).upper()
+            action = str(r["action"]).lower()
+            contracts = int(r["contracts"])
+            price = float(r["price"])
+            fees = float(r["fees"] or 0.0)
+            key = position_key(venue, ticker, side)
+            notes_by_key[key] = r["notes"]
+
+            if action == "buy":
+                existing = open_positions.get(key)
+                if existing is None:
+                    open_positions[key] = PaperPosition(
+                        ticker=ticker,
+                        side=side,
+                        contracts=contracts,
+                        avg_price=price,
+                        opened_at=r["placed_at"],
+                        venue=venue,
+                    )
+                else:
+                    total_contracts = existing.contracts + contracts
+                    existing.avg_price = (
+                        (existing.avg_price * existing.contracts) + (price * contracts)
+                    ) / total_contracts
+                    existing.contracts = total_contracts
+            elif action == "sell":
+                existing = open_positions.get(key)
+                if existing is None:
+                    continue
+                sell_contracts = min(contracts, existing.contracts)
+                realized = (price - existing.avg_price) * sell_contracts - fees
+                realized_by_key[key] = realized_by_key.get(key, 0.0) + realized
+                existing.contracts -= sell_contracts
+                if existing.contracts <= 0:
+                    conn.execute(
+                        """INSERT INTO paper_positions
+                           (venue, ticker, side, contracts, avg_price, opened_at,
+                            closed_at, realized_pnl, notes)
+                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                        (
+                            venue,
+                            ticker,
+                            side,
+                            0,
+                            existing.avg_price,
+                            existing.opened_at,
+                            r["placed_at"],
+                            realized_by_key.get(key, 0.0),
+                            notes_by_key.get(key),
+                        ),
+                    )
+                    del open_positions[key]
+                    realized_by_key.pop(key, None)
+
+        for key, pos in open_positions.items():
+            conn.execute(
+                """INSERT INTO paper_positions
+                   (venue, ticker, side, contracts, avg_price, opened_at,
+                    closed_at, realized_pnl, notes)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    pos.venue,
+                    pos.ticker,
+                    pos.side,
+                    pos.contracts,
+                    pos.avg_price,
+                    pos.opened_at,
+                    None,
+                    realized_by_key.get(key, 0.0),
+                    notes_by_key.get(key),
+                ),
+            )
 
     def execute_leg(
         self,
@@ -229,6 +393,7 @@ class PaperExecutor:
                 (self._now(), strategy, venue_l, ticker, side_u, action_l, contracts, price,
                  1 if is_maker else 0, fees, cost, notes),
             )
+            self._rebuild_positions_table(c)
 
         return {
             "venue": venue_l,

@@ -150,8 +150,11 @@ def score_wallet(
 
     # Score: realized PnL, decayed by recency, dampened by jackpot variance.
     # log1p so a $5M wallet doesn't 1000x a $5k wallet on linear PnL alone.
+    # Stability is multiplicative to penalize one-off jackpot wallets more
+    # aggressively than the old half-strength dampener.
     raw_pnl = max(0.0, stats.realized_pnl_usd)
-    score = math.log1p(raw_pnl) * recency * (0.5 + 0.5 * stability)
+    resolved_depth = min(1.0, stats.n_resolved_markets / max(1, min_resolved))
+    score = math.log1p(raw_pnl) * recency * stability * resolved_depth
 
     return WalletScore(
         wallet=wallet.lower(),

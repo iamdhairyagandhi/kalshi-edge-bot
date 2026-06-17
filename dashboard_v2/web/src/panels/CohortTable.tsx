@@ -27,7 +27,7 @@ export default function CohortTable() {
                   <td className="mono" title={w.wallet}>
                     {w.wallet.slice(0, 6)}…{w.wallet.slice(-4)}
                   </td>
-                  <td className="right neu">{w.score.toFixed(0)}</td>
+                  <td className="right neu">{Number(w.score).toFixed(0)}</td>
                   <td className="right dim">{w.n_trades || "—"}</td>
                 </tr>
               ))}

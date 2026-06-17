@@ -5,7 +5,9 @@ export type Portfolio = {
   starting_bankroll: number;
   cash: number;
   open_position_cost: number;
+  fees_paid: number;
   realized_pnl: number;
+  unrealized_pnl: number;
   bankroll: number;
   n_open_positions: number;
   n_open_kalshi: number;
@@ -37,7 +39,11 @@ export type EquityPoint = { timestamp_unix: number; equity: number; venue?: stri
 
 export type Position = {
   id: number; venue: string; ticker: string; side: string;
-  contracts: number; avg_price: number; opened_at: string;
+  condition_id: string | null; market_title: string | null; market_url: string | null; outcome_index: number | null;
+  position_status: string; market_status: string;
+  contracts: number; avg_price: number; cost: number;
+  current_price: number | null; current_value: number | null; unrealized_pnl: number | null;
+  potential_payout: number; max_profit: number; opened_at: string;
   closed_at: string | null; realized_pnl: number;
 };
 
@@ -70,6 +76,115 @@ export type Signal = {
 
 export type LatencyBucket = { upper_seconds: number; count: number };
 
+export type CrossVenueRun = {
+  run_id: string;
+  scanned_at_unix: number;
+  kalshi_markets: number;
+  kalshi_eligible_markets: number;
+  kalshi_excluded_mve: number;
+  polymarket_markets: number;
+  matched_markets: number;
+  books_checked: number;
+  candidates: number;
+  min_match_score: number;
+  min_spread: number;
+  notes: string | null;
+};
+
+export type CrossVenueSpread = {
+  id: number;
+  run_id: string;
+  scanned_at_unix: number;
+  kalshi_ticker: string;
+  kalshi_title: string;
+  polymarket_condition_id: string;
+  polymarket_question: string;
+  polymarket_token_id: string;
+  polymarket_outcome_index: number;
+  polymarket_outcome_label: string;
+  match_score: number;
+  kalshi_yes_bid: number;
+  kalshi_yes_ask: number;
+  polymarket_yes_bid: number;
+  polymarket_yes_ask: number;
+  valuation_spread: number;
+  best_executable_spread: number;
+  direction: string;
+  decision: string;
+  notes: string | null;
+};
+
+export type CrossVenueSnapshot = {
+  latest_run: CrossVenueRun | null;
+  spreads: CrossVenueSpread[];
+};
+
+export type TradeDiagnosticRow = {
+  id: number;
+  recorded_unix: number;
+  strategy: string;
+  venue: string;
+  market_id: string;
+  market_title: string | null;
+  side: string | null;
+  decision: string;
+  reason: string;
+  metric_name: string | null;
+  metric_value: number | null;
+  threshold_value: number | null;
+  observed_price: number | null;
+  reference_price: number | null;
+  details: string | null;
+};
+
+export type TradeDiagnosticSummary = {
+  strategy: string;
+  venue: string;
+  reason: string;
+  count: number;
+};
+
+export type TradeDiagnosticSnapshot = {
+  summary: TradeDiagnosticSummary[];
+  rows: TradeDiagnosticRow[];
+};
+
+export type WeatherEstimate = {
+  id: number;
+  run_id: string;
+  recorded_unix: number;
+  venue: string;
+  market_id: string;
+  title: string | null;
+  city: string | null;
+  kind: string | null;
+  threshold: number | null;
+  comparator: string | null;
+  forecast_value: number | null;
+  sigma: number | null;
+  p_yes: number | null;
+  yes_bid: number | null;
+  yes_ask: number | null;
+  edge_yes: number | null;
+  edge_no: number | null;
+  recommendation: string;
+  confidence: number | null;
+  ai_used: boolean;
+  notes: string | null;
+};
+
+export type WeatherRecommendationSummary = {
+  recommendation: string;
+  count: number;
+};
+
+export type WeatherSnapshot = {
+  latest_run_id: string | null;
+  latest_recorded_unix: number | null;
+  summary: WeatherRecommendationSummary[];
+  rows: WeatherEstimate[];
+};
+
 async function getJSON<T>(path: string): Promise<T> {
   const r = await fetch(path);
   if (!r.ok) throw new Error(`${path} → ${r.status}`);
@@ -94,6 +209,9 @@ export const api = {
   signals:   () => getJSON<Signal[]>("/api/signals?limit=200"),
   cohort:    () => getJSON<CohortWallet[]>("/api/cohort"),
   latency:   () => getJSON<LatencyBucket[]>("/api/latency"),
+  crossVenue:() => getJSON<CrossVenueSnapshot>("/api/cross-venue?limit=50"),
+  diagnostics:() => getJSON<TradeDiagnosticSnapshot>("/api/diagnostics?limit=100"),
+  weather:   () => getJSON<WeatherSnapshot>("/api/weather?limit=100"),
   brier:     () => getJSON<Brier[]>("/api/calibration"),
   killswitch:() => getJSON<StrategyState[]>("/api/killswitch"),
   toggleKill:(strategy: string, enabled: boolean, reason?: string) =>

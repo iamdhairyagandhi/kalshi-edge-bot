@@ -1,11 +1,12 @@
 import { useStore } from "../store";
 
 const fmt = (n: number | null | undefined, d = 2) =>
-  n == null ? "—" : n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+  n == null ? "—" : Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
 
 export default function PortfolioCard() {
   const p = useStore((s) => s.portfolio);
   const realized = p?.realized_pnl ?? 0;
+  const unrealized = p?.unrealized_pnl ?? 0;
   return (
     <div className="panel">
       <div className="panel-header">
@@ -30,9 +31,19 @@ export default function PortfolioCard() {
             <span className="value">${fmt(p?.bankroll)}</span>
           </div>
           <div className="kpi">
+            <span className="label">Fees paid</span>
+            <span className="value down">-${fmt(p?.fees_paid)}</span>
+          </div>
+          <div className="kpi">
             <span className="label">Realized PnL</span>
             <span className={`value ${realized >= 0 ? "up" : "down"}`}>
               {realized >= 0 ? "+" : ""}${fmt(realized)}
+            </span>
+          </div>
+          <div className="kpi">
+            <span className="label">Unrealized PnL</span>
+            <span className={`value ${unrealized >= 0 ? "up" : "down"}`}>
+              {unrealized >= 0 ? "+" : ""}${fmt(unrealized)}
             </span>
           </div>
           <div className="kpi">

@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from dashboard_v2.api.db import ro_cursor, table_exists
 from dashboard_v2.api.models import EquityPoint, PortfolioSnapshot
+from src.clients.polymarket import PolymarketAPIError, PolymarketClient
 from src.config import settings
 
 
@@ -28,11 +29,23 @@ def portfolio(venue: Optional[str] = Query(default=None)) -> PortfolioSnapshot:
         return PortfolioSnapshot(
             starting_bankroll=settings.starting_bankroll,
             cash=settings.starting_bankroll, open_position_cost=0.0,
-            realized_pnl=0.0, bankroll=settings.starting_bankroll,
+            fees_paid=0.0, realized_pnl=0.0, bankroll=settings.starting_bankroll,
             n_open_positions=0, n_open_kalshi=0, n_open_polymarket=0,
         )
 
     where, params = _venue_clause(venue)
+    momentum_join = ""
+    momentum_fields = "NULL AS condition_id"
+    if table_exists(db, "polymarket_momentum_signals"):
+        momentum_join = """
+            LEFT JOIN (
+              SELECT outcome_token_id, MAX(condition_id) AS condition_id
+              FROM polymarket_momentum_signals
+              GROUP BY outcome_token_id
+            ) pm ON p.ticker = pm.outcome_token_id
+        """
+        momentum_fields = "pm.condition_id AS condition_id"
+
     with ro_cursor(db) as cur:
         # Sum fees and cost flows. Buys reduce cash, sells add cash.
         agg = cur.execute(
@@ -49,12 +62,14 @@ def portfolio(venue: Optional[str] = Query(default=None)) -> PortfolioSnapshot:
         # Open positions: aggregate by (venue, ticker, side) - sum buys - sum sells.
         pos_rows = cur.execute(
             f"""
-            SELECT venue, ticker, side,
-                SUM(CASE WHEN action='buy' THEN contracts ELSE -contracts END) AS net_contracts,
-                SUM(CASE WHEN action='buy' THEN cost ELSE 0 END) AS total_buy_cost,
-                SUM(CASE WHEN action='buy' THEN contracts ELSE 0 END) AS total_buy_contracts
-            FROM paper_trades WHERE 1=1 {where}
-            GROUP BY venue, ticker, side
+            SELECT p.venue, p.ticker, p.side, {momentum_fields},
+                SUM(CASE WHEN p.action='buy' THEN p.contracts ELSE -p.contracts END) AS net_contracts,
+                SUM(CASE WHEN p.action='buy' THEN p.cost ELSE 0 END) AS total_buy_cost,
+                SUM(CASE WHEN p.action='buy' THEN p.contracts ELSE 0 END) AS total_buy_contracts
+            FROM paper_trades p
+            {momentum_join}
+            WHERE 1=1 {where.replace("venue", "p.venue")}
+            GROUP BY p.venue, p.ticker, p.side
             HAVING net_contracts > 0
             """,
             params,
@@ -72,23 +87,88 @@ def portfolio(venue: Optional[str] = Query(default=None)) -> PortfolioSnapshot:
             params,
         ).fetchone()
 
-    open_cost = sum(p["total_buy_cost"] * (p["net_contracts"] / max(1, p["total_buy_contracts"])) for p in pos_rows)
-    n_open = len(pos_rows)
-    n_kalshi = sum(1 for p in pos_rows if p["venue"] == "kalshi")
-    n_poly = sum(1 for p in pos_rows if p["venue"] == "polymarket")
-    cash = settings.starting_bankroll + cash_delta
-    bankroll = cash + open_cost
+    mark_prices = _load_polymarket_mark_prices(pos_rows)
+    open_cost = 0.0
+    open_value = 0.0
+    resolved_cash = 0.0
+    realized_resolution_pnl = 0.0
+    open_rows = []
+    for p in pos_rows:
+        row_cost = p["total_buy_cost"] * (p["net_contracts"] / max(1, p["total_buy_contracts"]))
+        mark = mark_prices.get(str(p["ticker"]))
+        if p["venue"] == "polymarket" and mark is not None and mark["closed"]:
+            payout = float(p["net_contracts"]) * float(mark["price"])
+            resolved_cash += payout
+            realized_resolution_pnl += payout - row_cost
+            continue
+        open_cost += row_cost
+        open_value += (
+            float(p["net_contracts"]) * float(mark["price"])
+            if p["venue"] == "polymarket" and mark is not None
+            else row_cost
+        )
+        open_rows.append(p)
+
+    n_open = len(open_rows)
+    n_kalshi = sum(1 for p in open_rows if p["venue"] == "kalshi")
+    n_poly = sum(1 for p in open_rows if p["venue"] == "polymarket")
+    cash = settings.starting_bankroll + cash_delta + resolved_cash
+    bankroll = cash + open_value
 
     return PortfolioSnapshot(
         starting_bankroll=settings.starting_bankroll,
         cash=cash,
         open_position_cost=open_cost,
-        realized_pnl=(realized["realized_pnl_approx"] or 0.0),
+        fees_paid=agg["total_fees"] or 0.0,
+        realized_pnl=(realized["realized_pnl_approx"] or 0.0) + realized_resolution_pnl,
+        unrealized_pnl=open_value - open_cost,
         bankroll=bankroll,
         n_open_positions=n_open,
         n_open_kalshi=n_kalshi,
         n_open_polymarket=n_poly,
     )
+
+
+def _load_polymarket_mark_prices(rows) -> dict[str, dict[str, float | bool]]:
+    token_to_condition = {
+        str(r["ticker"]): str(r["condition_id"])
+        for r in rows
+        if r["venue"] == "polymarket" and r["condition_id"]
+    }
+    if not token_to_condition:
+        return {}
+
+    out: dict[str, dict[str, float | bool]] = {}
+    client = PolymarketClient()
+    try:
+        for token_id, condition_id in token_to_condition.items():
+            try:
+                market = client.get_market(condition_id)
+            except PolymarketAPIError:
+                continue
+            if not market.closed:
+                price = _polymarket_live_sell_price(client, token_id)
+                if price is not None:
+                    out[token_id] = {"price": price, "closed": False}
+                continue
+            for outcome in market.outcomes:
+                if outcome.token_id == token_id and outcome.price is not None:
+                    out[token_id] = {"price": float(outcome.price), "closed": True}
+                    break
+    finally:
+        client.close()
+    return out
+
+
+def _polymarket_live_sell_price(client: PolymarketClient, token_id: str) -> Optional[float]:
+    try:
+        book = client.get_orderbook(token_id)
+    except PolymarketAPIError:
+        return None
+    bids = book.get("bids") or []
+    if not bids:
+        return None
+    return max(float(b["price"]) for b in bids)
 
 
 @router.get("/equity", response_model=List[EquityPoint])

@@ -1,6 +1,7 @@
 # Generic secrets
 .env
 *.pem
+*.pem.txt
 *.key
 
 # Python

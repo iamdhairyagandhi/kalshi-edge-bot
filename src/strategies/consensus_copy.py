@@ -63,7 +63,9 @@ class ConsensusSignal:
             self.venue,
             self.condition_id,
             self.outcome_token_id,
-            str(self.window_start_unix),
+            str(self.consensus_k),
+            str(self.first_trade_unix),
+            str(self.last_trade_unix),
             self.cohort_version,
         )
         return hashlib.sha1("|".join(parts).encode()).hexdigest()
@@ -125,6 +127,7 @@ def detect_consensus_signals(
     window_end_unix: int,
     consensus_k: int,
     venue: str = "polymarket",
+    wallet_weights: Optional[Dict[str, float]] = None,
 ) -> List[ConsensusSignal]:
     """Return one ConsensusSignal per outcome token that crossed the K-of-N
     threshold within the window. Idempotency is the caller's responsibility
@@ -137,6 +140,7 @@ def detect_consensus_signals(
         )
 
     cohort_set: Set[str] = {w.lower() for w in cohort_wallets}
+    weights = {w.lower(): float(v) for w, v in (wallet_weights or {}).items()}
     ver = cohort_version(cohort_set)
 
     # Normalize incoming `cohort_trades` to lowercase keys so callers don't
@@ -159,7 +163,8 @@ def detect_consensus_signals(
             w: stats for w, stats in wallets.items()
             if stats["net_shares"] > 0 and w in cohort_set
         }
-        if len(voters) < consensus_k:
+        total_vote_weight = sum(weights.get(w, 1.0) for w in voters)
+        if total_vote_weight < consensus_k:
             continue
 
         # Filter out closed / non-tradeable markets
@@ -175,10 +180,16 @@ def detect_consensus_signals(
             # Token id we don't recognize on this market — skip safely.
             continue
 
-        # Take the K wallets with the largest net-share votes (most committed).
+        # Take wallets until their weighted vote crosses the threshold.
         ranked = sorted(voters.items(),
-                        key=lambda kv: (-kv[1]["net_shares"], kv[0]))
-        agreeing = [w for w, _ in ranked[:consensus_k]]
+                        key=lambda kv: (-(kv[1]["net_shares"] * weights.get(kv[0], 1.0)), kv[0]))
+        agreeing: List[str] = []
+        agreeing_weight = 0.0
+        for w, _ in ranked:
+            agreeing.append(w)
+            agreeing_weight += weights.get(w, 1.0)
+            if agreeing_weight >= consensus_k:
+                break
         first_ts = int(min(voters[w]["first_ts"] for w in agreeing))
         last_ts = int(max(voters[w]["last_ts"] for w in agreeing))
 

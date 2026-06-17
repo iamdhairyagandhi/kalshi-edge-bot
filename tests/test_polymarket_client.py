@@ -91,13 +91,13 @@ def replay_dir(tmp_path):
         },
     ]))
 
-    # /leaderboard
+    # /v1/leaderboard
     lb_path = d / _fixture_filename(
-        "/leaderboard", {"window": "month", "metric": "profit", "limit": 50}
+        "/v1/leaderboard", {"timePeriod": "MONTH", "orderBy": "PNL", "limit": 50}
     )
     lb_path.write_text(json.dumps([
-        {"wallet": "0xA", "profit": 50000, "volume": 1_000_000},
-        {"wallet": "0xB", "profit": 30000, "volume":   500_000},
+        {"proxyWallet": "0xA", "pnl": 50000, "vol": 1_000_000},
+        {"proxyWallet": "0xB", "pnl": 30000, "vol":   500_000},
     ]))
 
     # /book?token_id=111
@@ -157,7 +157,7 @@ def test_get_leaderboard_passthrough(replay_dir):
     c = PolymarketClient(replay_dir=str(replay_dir))
     rows = c.get_leaderboard(window="month", metric="profit", limit=50)
     assert len(rows) == 2
-    assert rows[0]["wallet"] == "0xA"
+    assert rows[0]["proxyWallet"] == "0xA"
 
 
 def test_get_orderbook_passthrough(replay_dir):

@@ -9,6 +9,14 @@ Kalshi orderbook response format (v2):
   }
 }
 
+Newer fractional-price responses may instead look like:
+{
+  "orderbook_fp": {
+    "yes_dollars": [["0.4200", "12.00"], ...],
+    "no_dollars":  [["0.5800", "12.00"], ...],
+  }
+}
+
 Important quirks (verified against Kalshi/kalshi-starter-code-python and docs):
 
 1. Both `yes` and `no` arrays are BIDS only. Asks are *derived* from the
@@ -53,9 +61,9 @@ def parse_orderbook(ticker: str, payload: Dict[str, Any]) -> Optional[Orderbook]
     Build an Orderbook from a Kalshi /markets/{ticker}/orderbook response.
     Returns None if the book is empty (no bids on either side).
     """
-    ob = payload.get("orderbook") or payload
-    yes_bids = ob.get("yes") or []
-    no_bids = ob.get("no") or []
+    ob = payload.get("orderbook") or payload.get("orderbook_fp") or payload
+    yes_bids = ob.get("yes") or ob.get("yes_dollars") or []
+    no_bids = ob.get("no") or ob.get("no_dollars") or []
 
     yes_top = _best_bid_level(yes_bids)
     no_top = _best_bid_level(no_bids)

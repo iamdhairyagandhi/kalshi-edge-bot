@@ -48,7 +48,7 @@ export default function KillSwitchPanel() {
               {strategies.map((s) => (
                 <tr key={s.strategy}>
                   <td className="mono" title={s.disabled_reason || ""}>{s.strategy}</td>
-                  <td className="right mono">{s.last_brier != null ? s.last_brier.toFixed(3) : "—"}</td>
+                  <td className="right mono">{s.last_brier != null ? Number(s.last_brier).toFixed(3) : "—"}</td>
                   <td className="right dim mono">{s.last_n_samples ?? "—"}</td>
                   <td>
                     <span className={`badge ${s.enabled ? "filled" : "rejected"}`}>

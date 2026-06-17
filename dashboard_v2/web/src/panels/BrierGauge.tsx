@@ -16,17 +16,18 @@ export default function BrierGauge() {
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {brier.map((b) => {
-              const score = Math.min(SCALE_MAX, b.brier_score);
+              const brierScore = Number(b.brier_score);
+              const score = Math.min(SCALE_MAX, brierScore);
               const pct = (score / SCALE_MAX) * 100;
-              const good = b.brier_score <= 0.18;
-              const warn = b.brier_score > 0.18 && b.brier_score <= 0.25;
+              const good = brierScore <= 0.18;
+              const warn = brierScore > 0.18 && brierScore <= 0.25;
               const color = good ? "var(--green)" : warn ? "var(--amber)" : "var(--red)";
               return (
                 <div key={b.strategy}>
                   <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
                     <span className="mono" style={{ fontSize: 12 }}>{b.strategy}</span>
                     <span className="mono" style={{ fontSize: 12, color }}>
-                      {b.brier_score.toFixed(4)} <span className="dim" style={{ fontSize: 10 }}>n={b.n_resolved}</span>
+                      {brierScore.toFixed(4)} <span className="dim" style={{ fontSize: 10 }}>n={b.n_resolved}</span>
                     </span>
                   </div>
                   <div style={{ position: "relative", background: "var(--bg-3)", height: 8, borderRadius: 2, overflow: "hidden" }}>

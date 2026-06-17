@@ -12,13 +12,31 @@ import pytest
 from src.clients.polymarket import (
     PolymarketMarket, PolymarketOutcome, PolymarketTrade,
 )
-from src.jobs.copy_runner import run_once
+from src.jobs.copy_runner import fetch_candidate_pool, run_once
 from src.paper.executor import PaperExecutor
 from src.utils.fee_models import PolymarketFeeModel
 
 
 NOW = 1_700_500_000
 WIN_LOOKBACK_H = 24
+
+
+class FakeLeaderboardClient:
+    def __init__(self):
+        self.calls = []
+
+    def get_leaderboard(self, *, window, metric, limit):
+        self.calls.append((window, metric, limit))
+        prefix = f"{window[:1]}{metric[:1]}"
+        return [{"proxyWallet": f"0x{prefix}{i:02d}"} for i in range(50)]
+
+
+def test_fetch_candidate_pool_combines_multiple_leaderboards():
+    client = FakeLeaderboardClient()
+    pool = fetch_candidate_pool(client, top_n=75)
+    assert len(pool) == 75
+    assert len(client.calls) >= 2
+    assert pool[0] == "0xmp00"
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +129,7 @@ def test_runner_paper_fills_when_consensus_and_book_ok():
             client=client, executor=executor, db_path=db,
             candidate_wallets=cohort, resolved_condition_ids=resolved,
             markets=markets, now_unix=NOW,
-            top_n=5, consensus_k=3, lookback_hours=24,
+            top_n=5, consensus_k=3, lookback_hours=24, fresh_signal_minutes=60,
             max_slippage_cents=0.05, notional_per_signal_usd=20.0,
         )
         assert summary.cohort_size == 5
@@ -140,7 +158,42 @@ def test_runner_paper_fills_when_consensus_and_book_ok():
         assert row[2] == pytest.approx(0.01, abs=1e-6)
 
 
-def test_runner_rejects_on_excessive_slippage():
+def test_runner_can_synthesize_recent_markets_from_prefetched_trades():
+    cohort = [f"0xW{i}" for i in range(5)]
+    trades_by_wallet: Dict[str, List[PolymarketTrade]] = {}
+    for w in cohort:
+        trades_by_wallet[w.lower()] = (
+            _profitable_history(w) +
+            [_trade(w, "BUY", 100, 0.45, NOW - 1000)]
+        )
+    resolved = [f"RES_{i}" for i in range(30)]
+    orderbook = {"asks": [{"price": "0.46", "size": "200"}], "bids": []}
+    client = FakePolyClient(trades_by_wallet={}, orderbooks={"YES_T": orderbook})
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        db = os.path.join(d, "x.db")
+        executor = PaperExecutor(
+            db, starting_bankroll=10000.0,
+            fee_models={"polymarket": PolymarketFeeModel(gas_usd=0.0)},
+        )
+        summary = run_once(
+            client=client, executor=executor, db_path=db,
+            candidate_wallets=cohort, resolved_condition_ids=resolved,
+            markets=None, now_unix=NOW,
+            candidate_trades=trades_by_wallet,
+            top_n=5, consensus_k=3, lookback_hours=24, fresh_signal_minutes=60,
+            max_slippage_cents=0.05, notional_per_signal_usd=20.0,
+        )
+
+        assert summary.signals_detected == 1
+        assert summary.signals_filled == 1
+        assert summary.recent_conditions == 1
+        assert summary.markets_available == 1
+        # Pre-fetched trades should prevent wallet fetches from being needed.
+        assert client.book_calls == ["YES_T"]
+
+
+def test_runner_watches_pullback_on_excessive_slippage():
     cohort = [f"0xW{i}" for i in range(5)]
     trades_by_wallet = {}
     for w in cohort:
@@ -165,20 +218,34 @@ def test_runner_rejects_on_excessive_slippage():
             client=client, executor=executor, db_path=db,
             candidate_wallets=cohort, resolved_condition_ids=resolved,
             markets=markets, now_unix=NOW,
-            top_n=5, consensus_k=3, lookback_hours=24,
+            top_n=5, consensus_k=3, lookback_hours=24, fresh_signal_minutes=60,
             max_slippage_cents=0.02, notional_per_signal_usd=20.0,
         )
         assert summary.signals_filled == 0
-        assert summary.signals_rejected == 1
+        assert summary.signals_rejected == 0
+        assert "watched=1" in summary.notes
         assert executor.portfolio.positions == {}
         conn = sqlite3.connect(db)
         try:
             (decision,) = conn.execute(
                 "SELECT decision FROM polymarket_consensus_signals"
             ).fetchone()
+            (watch_status,) = conn.execute(
+                "SELECT status FROM polymarket_pullback_watchlist"
+            ).fetchone()
+            diag = conn.execute(
+                "SELECT strategy, venue, reason, metric_value, threshold_value "
+                "FROM trade_diagnostics"
+            ).fetchone()
         finally:
             conn.close()
-        assert decision == "rejected_slippage"
+        assert decision == "watch_pullback"
+        assert watch_status == "watching"
+        assert diag[0] == "consensus_copy"
+        assert diag[1] == "polymarket"
+        assert diag[2] == "watch_pullback"
+        assert diag[3] == pytest.approx(0.10)
+        assert diag[4] == pytest.approx(0.011)
 
 
 def test_runner_is_idempotent_across_two_runs():
@@ -207,14 +274,14 @@ def test_runner_is_idempotent_across_two_runs():
             client=client, executor=executor, db_path=db,
             candidate_wallets=cohort, resolved_condition_ids=resolved,
             markets=markets, now_unix=NOW,
-            top_n=5, consensus_k=3, lookback_hours=24,
+            top_n=5, consensus_k=3, lookback_hours=24, fresh_signal_minutes=60,
             max_slippage_cents=0.05, notional_per_signal_usd=20.0,
         )
         s2 = run_once(
             client=client, executor=executor, db_path=db,
             candidate_wallets=cohort, resolved_condition_ids=resolved,
             markets=markets, now_unix=NOW,
-            top_n=5, consensus_k=3, lookback_hours=24,
+            top_n=5, consensus_k=3, lookback_hours=24, fresh_signal_minutes=60,
             max_slippage_cents=0.05, notional_per_signal_usd=20.0,
         )
         assert s1.signals_filled == 1
@@ -256,7 +323,7 @@ def test_runner_handles_missing_orderbook_gracefully():
             client=client, executor=executor, db_path=db,
             candidate_wallets=cohort, resolved_condition_ids=resolved,
             markets=markets, now_unix=NOW,
-            top_n=5, consensus_k=3, lookback_hours=24,
+            top_n=5, consensus_k=3, lookback_hours=24, fresh_signal_minutes=60,
             max_slippage_cents=0.05, notional_per_signal_usd=20.0,
         )
         assert summary.signals_filled == 0

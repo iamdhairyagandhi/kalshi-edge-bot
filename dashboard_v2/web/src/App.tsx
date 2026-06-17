@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { api, StreamClient } from "./api/client";
 import { useStore } from "./store";
 import TopBar from "./panels/TopBar";
@@ -12,15 +12,29 @@ import PortfolioCard from "./panels/PortfolioCard";
 import BrierGauge from "./panels/BrierGauge";
 import KillSwitchPanel from "./panels/KillSwitchPanel";
 import OrderbookDepth from "./panels/OrderbookDepth";
+import CrossVenueSpread from "./panels/CrossVenueSpread";
+import TradeBlockers from "./panels/TradeBlockers";
+import WeatherSpecialist from "./panels/WeatherSpecialist";
+
+type DashboardTab = "live" | "smart" | "weather" | "arbitrage" | "risk";
+
+const tabs: { id: DashboardTab; label: string }[] = [
+  { id: "live", label: "Live Trades" },
+  { id: "smart", label: "Smart Money" },
+  { id: "weather", label: "Weather" },
+  { id: "arbitrage", label: "Arbitrage" },
+  { id: "risk", label: "Risk" },
+];
 
 export default function App() {
   const { venue, setSnapshot, setWsAlive, pushFill, pushSignal } = useStore();
+  const [activeTab, setActiveTab] = useState<DashboardTab>("live");
 
   useEffect(() => {
     let cancelled = false;
     async function refresh() {
       try {
-        const [portfolio, equity, positions, fills, signals, cohort, latency, brier] = await Promise.all([
+        const [portfolio, equity, positions, fills, signals, cohort, latency, crossVenue, diagnostics, weather, brier] = await Promise.all([
           api.portfolio(venue === "all" ? undefined : venue),
           api.equity(venue === "all" ? undefined : venue),
           api.positions(venue === "all" ? undefined : venue),
@@ -28,10 +42,13 @@ export default function App() {
           api.signals(),
           api.cohort(),
           api.latency(),
+          api.crossVenue(),
+          api.diagnostics(),
+          api.weather(),
           api.brier().catch(() => []),
         ]);
         if (cancelled) return;
-        setSnapshot({ portfolio, equity, positions, fills, signals, cohort, latency, brier });
+        setSnapshot({ portfolio, equity, positions, fills, signals, cohort, latency, crossVenue, diagnostics, weather, brier });
       } catch (e) {
         console.warn("snapshot refresh failed", e);
       }
@@ -56,18 +73,78 @@ export default function App() {
   return (
     <>
       <TopBar />
-      <div className="dash-grid">
-        <div className="cell-equity"><EquityCurve /></div>
-        <div className="cell-cohort"><CohortTable /></div>
-        <div className="cell-positions"><PositionsTable /></div>
-        <div className="cell-signals"><ConsensusFeed /></div>
-        <div className="cell-book"><OrderbookDepth /></div>
-        <div className="cell-fills"><FillsTable /></div>
-        <div className="cell-latency"><LatencyHistogram /></div>
-        <div className="cell-brier"><BrierGauge /></div>
-        <div className="cell-kill"><KillSwitchPanel /></div>
-        <div className="cell-portfolio"><PortfolioCard /></div>
+      <div className="workspace">
+        <nav className="tabbar" aria-label="Dashboard sections">
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              className={`tab ${activeTab === tab.id ? "active" : ""}`}
+              onClick={() => setActiveTab(tab.id)}
+              type="button"
+            >
+              {tab.label}
+            </button>
+          ))}
+        </nav>
+        {activeTab === "live" ? <LiveTradesTab /> : null}
+        {activeTab === "smart" ? <SmartMoneyTab /> : null}
+        {activeTab === "weather" ? <WeatherTab /> : null}
+        {activeTab === "arbitrage" ? <ArbitrageTab /> : null}
+        {activeTab === "risk" ? <RiskTab /> : null}
       </div>
     </>
+  );
+}
+
+function LiveTradesTab() {
+  return (
+    <div className="tab-grid live-grid">
+      <section className="span-2"><EquityCurve /></section>
+      <section><PortfolioCard /></section>
+      <section><OrderbookDepth /></section>
+      <section className="span-2"><PositionsTable /></section>
+      <section className="span-2"><FillsTable /></section>
+    </div>
+  );
+}
+
+function SmartMoneyTab() {
+  return (
+    <div className="tab-grid smart-grid">
+      <section><CohortTable /></section>
+      <section><ConsensusFeed /></section>
+      <section><LatencyHistogram /></section>
+      <section className="span-3"><TradeBlockers /></section>
+    </div>
+  );
+}
+
+function WeatherTab() {
+  return (
+    <div className="tab-grid weather-grid">
+      <section className="span-3"><WeatherSpecialist /></section>
+      <section className="span-3"><TradeBlockers /></section>
+    </div>
+  );
+}
+
+function ArbitrageTab() {
+  return (
+    <div className="tab-grid arbitrage-grid">
+      <section className="span-2"><CrossVenueSpread /></section>
+      <section><OrderbookDepth /></section>
+      <section className="span-3"><TradeBlockers /></section>
+    </div>
+  );
+}
+
+function RiskTab() {
+  return (
+    <div className="tab-grid risk-grid">
+      <section><PortfolioCard /></section>
+      <section><BrierGauge /></section>
+      <section><KillSwitchPanel /></section>
+      <section className="span-3"><TradeBlockers /></section>
+    </div>
   );
 }

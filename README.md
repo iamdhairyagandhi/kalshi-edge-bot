@@ -3,7 +3,8 @@
 A deterministic, fee-aware trading bot for [Kalshi](https://kalshi.com) **and
 [Polymarket](https://polymarket.com)**. Focused on **structural edges** that
 don't require an LLM oracle: overround arbitrage on Kalshi and
-smart-money consensus copy-trading on Polymarket.
+smart-money consensus copy-trading on Polymarket, plus cross-venue
+spread diagnostics between likely-equivalent markets.
 
 > **No promises.** Prediction markets are competitive. Edges are small.
 > This bot will lose money if you run it without understanding the code.
@@ -24,12 +25,17 @@ What's built:
 - ✅ K-of-N consensus-copy strategy (`src/strategies/consensus_copy.py`)
 - ✅ Polymarket copy-runner with idempotent signal log + slippage gates
   (`src/jobs/copy_runner.py`)
+- ✅ Safe Compounder signal scanner, refactored onto the shared Kalshi fee model
+  (`src/strategies/safe_compounder.py`)
+- ✅ Cross-venue Kalshi/Polymarket spread scanner with persistent diagnostics
+  (`src/strategies/cross_venue_spread.py`, `src/jobs/cross_venue_runner.py`)
+- ✅ React/FastAPI dashboard v2 with cohort, consensus signal, latency,
+  orderbook, cross-venue spread, and kill-switch panels (`dashboard_v2/`)
 
 What's next:
-- [ ] Port signed Kalshi REST + WS client (from ryanfrigo/kalshi-ai-trading-bot, MIT)
-- [ ] Port `safe_compounder` strategy, refactored to use new fees module
+- [ ] Add Kalshi WebSocket ingest for lower-latency orderbook updates
+- [ ] Wire `safe_compounder` into runner → gates → execute → calibration
 - [ ] Wire ingest → strategy → gates → execute → calibration pipeline
-- [ ] Dashboard panels for the Polymarket cohort + consensus signals + latency
 - [ ] Live Polymarket CLOB execution via `polymarket-client` SDK
 
 ## Why these strategies
@@ -60,7 +66,18 @@ Key invariants enforced in `src/strategies/consensus_copy.py`:
 Retail traders systematically overpay for unlikely positive outcomes
 ("YES, it will happen"). Selling NO on near-certain tails with maker
 orders captures this bias while paying near-zero fees. Math is in
-`safe_compounder.py` (port pending).
+`safe_compounder.py`; runner/execution wiring is still pending.
+
+### Cross-venue spread diagnostics
+`cli.py cross-venue-scan` compares likely-equivalent binary markets across
+Kalshi and Polymarket, then records the latest run and matched price rows
+to SQLite for the dashboard. It reports both:
+- valuation spread: `Kalshi YES ask - Polymarket YES/UP ask`
+- executable spread: best of `Kalshi YES bid - Polymarket ask` and
+  `Polymarket bid - Kalshi YES ask`
+
+This is scanner-only. It does not execute trades because equivalence must
+be checked against market rules before any cross-venue position is safe.
 
 ## What this bot WILL NOT do
 
@@ -78,7 +95,6 @@ cd kalshi-edge-bot
 python -m venv .venv
 .venv/Scripts/activate    # or source .venv/bin/activate on Unix
 pip install -r requirements.txt
-pip install hypothesis    # property-test deps not pinned in requirements yet
 pytest
 ```
 
@@ -114,8 +130,12 @@ cli.py calibration     Brier score + reliability diagram
 
 Polymarket commands:
 ```
+cli.py health --venue all          Check Kalshi + Polymarket connectivity
+cli.py health --venue kalshi       Check Kalshi connectivity/auth
+cli.py polymarket-health           Check Polymarket public API connectivity
 cli.py polymarket-leaderboard   Re-rank the leaderboard under our criteria + show the cohort
 cli.py polymarket-scan          One consensus-copy scan + (paper) execute pass
+cli.py cross-venue-scan         Compare likely-equivalent Kalshi/Polymarket spreads
 ```
 
 ## Dashboard
@@ -136,7 +156,19 @@ It opens SQLite in `mode=ro`, so it is safe to run alongside a live
 runner without lock contention.
 
 Polymarket-specific panels (cohort table, consensus feed, latency,
-attribution) are planned — see plan.md.
+orderbook depth, and kill-switch controls) are available in `dashboard_v2/`.
+
+Backend:
+```bash
+uvicorn dashboard_v2.api.main:app --reload --host 127.0.0.1 --port 8787
+```
+
+Frontend:
+```bash
+cd dashboard_v2/web
+npm install
+npm run dev
+```
 
 ## Attribution
 

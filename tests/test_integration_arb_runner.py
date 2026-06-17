@@ -2,6 +2,7 @@
 verify arb opportunities get caught and (paper) executed."""
 
 import os
+import sqlite3
 import tempfile
 
 import httpx
@@ -83,6 +84,15 @@ async def test_full_scan_pass_executes_qualifying_arb(mock_kalshi):
         assert "kalshi:KXARB-1:NO" in executor.portfolio.positions
         # KXNOARB has no opportunity
         assert "kalshi:KXNOARB-1:YES" not in executor.portfolio.positions
+        conn = sqlite3.connect(os.path.join(d, "test.db"))
+        try:
+            row = conn.execute(
+                "SELECT strategy, venue, reason FROM trade_diagnostics "
+                "WHERE market_id='KXNOARB-1'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row == ("overround_arb", "kalshi", "edge_below_threshold")
 
         await client.close()
 

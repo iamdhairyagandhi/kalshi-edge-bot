@@ -122,7 +122,7 @@ def test_run_once_records_snapshot():
             client=client, executor=executor, db_path=db,
             candidate_wallets=cohort, resolved_condition_ids=resolved,
             markets=markets, now_unix=NOW,
-            top_n=5, consensus_k=3, lookback_hours=24,
+            top_n=5, consensus_k=3, lookback_hours=24, fresh_signal_minutes=60,
             max_slippage_cents=0.05, notional_per_signal_usd=20.0,
         )
 

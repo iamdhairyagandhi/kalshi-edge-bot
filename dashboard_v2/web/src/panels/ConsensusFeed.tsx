@@ -1,6 +1,6 @@
 import { useStore } from "../store";
 
-const fmt = (n: number, d = 2) => n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+const fmt = (n: number, d = 2) => Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
 const ago = (unix: number) => {
   const s = Math.max(0, Math.floor(Date.now() / 1000) - unix);
   if (s < 60) return `${s}s`;

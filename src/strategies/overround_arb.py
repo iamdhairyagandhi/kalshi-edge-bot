@@ -70,7 +70,13 @@ class ArbOpportunity:
     net_profit_total: float
 
 
-def find_buy_both_arb(book: Orderbook, max_contracts: int = 50) -> Optional[ArbOpportunity]:
+def find_buy_both_arb(
+    book: Orderbook,
+    max_contracts: int = 50,
+    *,
+    min_net_edge_per_contract: float = MIN_NET_EDGE_PER_CONTRACT,
+    safety_margin: float = SAFETY_MARGIN,
+) -> Optional[ArbOpportunity]:
     """
     Look for: YES_ask + NO_ask < 1.00 - fees - margin.
     Buying both sides locks $1 at settlement.
@@ -88,9 +94,9 @@ def find_buy_both_arb(book: Orderbook, max_contracts: int = 50) -> Optional[ArbO
     fees_per = fees / contracts
 
     gross_edge_per = 1.0 - sum_asks
-    net_edge_per = gross_edge_per - fees_per - SAFETY_MARGIN
+    net_edge_per = gross_edge_per - fees_per - safety_margin
 
-    if net_edge_per < MIN_NET_EDGE_PER_CONTRACT:
+    if net_edge_per < min_net_edge_per_contract:
         return None
 
     return ArbOpportunity(
@@ -106,7 +112,13 @@ def find_buy_both_arb(book: Orderbook, max_contracts: int = 50) -> Optional[ArbO
     )
 
 
-def find_sell_both_arb(book: Orderbook, max_contracts: int = 50) -> Optional[ArbOpportunity]:
+def find_sell_both_arb(
+    book: Orderbook,
+    max_contracts: int = 50,
+    *,
+    min_net_edge_per_contract: float = MIN_NET_EDGE_PER_CONTRACT,
+    safety_margin: float = SAFETY_MARGIN,
+) -> Optional[ArbOpportunity]:
     """
     Look for: YES_bid + NO_bid > 1.00 + fees + margin.
     Selling both sides (hitting both bids) banks the overround.
@@ -127,9 +139,9 @@ def find_sell_both_arb(book: Orderbook, max_contracts: int = 50) -> Optional[Arb
     fees_per = fees / contracts
 
     gross_edge_per = sum_bids - 1.0
-    net_edge_per = gross_edge_per - fees_per - SAFETY_MARGIN
+    net_edge_per = gross_edge_per - fees_per - safety_margin
 
-    if net_edge_per < MIN_NET_EDGE_PER_CONTRACT:
+    if net_edge_per < min_net_edge_per_contract:
         return None
 
     return ArbOpportunity(
@@ -145,7 +157,13 @@ def find_sell_both_arb(book: Orderbook, max_contracts: int = 50) -> Optional[Arb
     )
 
 
-def scan_orderbooks(books: List[Orderbook], max_contracts: int = 50) -> List[ArbOpportunity]:
+def scan_orderbooks(
+    books: List[Orderbook],
+    max_contracts: int = 50,
+    *,
+    min_net_edge_per_contract: float = MIN_NET_EDGE_PER_CONTRACT,
+    safety_margin: float = SAFETY_MARGIN,
+) -> List[ArbOpportunity]:
     """
     Return all arb opportunities sorted by net profit, descending.
 
@@ -158,7 +176,12 @@ def scan_orderbooks(books: List[Orderbook], max_contracts: int = 50) -> List[Arb
     by_ticker: dict = {}
     for b in books:
         for finder in (find_buy_both_arb, find_sell_both_arb):
-            opp = finder(b, max_contracts=max_contracts)
+            opp = finder(
+                b,
+                max_contracts=max_contracts,
+                min_net_edge_per_contract=min_net_edge_per_contract,
+                safety_margin=safety_margin,
+            )
             if opp is None:
                 continue
             existing = by_ticker.get(opp.ticker)

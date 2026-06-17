@@ -1,5 +1,18 @@
 import { create } from "zustand";
-import type { Fill, Portfolio, Position, Signal, CohortWallet, EquityPoint, LatencyBucket, Brier, StrategyState } from "../api/client";
+import type {
+  CrossVenueSnapshot,
+  Fill,
+  Portfolio,
+  Position,
+  Signal,
+  CohortWallet,
+  EquityPoint,
+  LatencyBucket,
+  Brier,
+  StrategyState,
+  TradeDiagnosticSnapshot,
+  WeatherSnapshot,
+} from "../api/client";
 
 type State = {
   venue: "all" | "kalshi" | "polymarket";
@@ -11,6 +24,9 @@ type State = {
   signals: Signal[];
   cohort: CohortWallet[];
   latency: LatencyBucket[];
+  crossVenue: CrossVenueSnapshot;
+  diagnostics: TradeDiagnosticSnapshot;
+  weather: WeatherSnapshot;
   brier: Brier[];
   strategies: StrategyState[];
   // mutators
@@ -32,6 +48,9 @@ export const useStore = create<State>((set) => ({
   signals: [],
   cohort: [],
   latency: [],
+  crossVenue: { latest_run: null, spreads: [] },
+  diagnostics: { summary: [], rows: [] },
+  weather: { latest_run_id: null, latest_recorded_unix: null, summary: [], rows: [] },
   brier: [],
   strategies: [],
   setVenue: (venue) => set({ venue }),

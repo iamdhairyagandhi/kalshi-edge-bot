@@ -31,7 +31,7 @@ export default function OrderbookDepth() {
   }, [defaultCond, defaultIdx]);
 
   const maxSize = book
-    ? Math.max(1, ...book.bids.slice(0, 8).map((l) => l.size), ...book.asks.slice(0, 8).map((l) => l.size))
+    ? Math.max(1, ...book.bids.slice(0, 8).map((l) => toFinite(l.size)), ...book.asks.slice(0, 8).map((l) => toFinite(l.size)))
     : 1;
 
   return (
@@ -64,7 +64,7 @@ export default function OrderbookDepth() {
             }}>
               <span>spread</span>
               <span>{book.asks[0] && book.bids[0]
-                ? ((book.asks[0].price - book.bids[0].price) * 100).toFixed(1) + "¢"
+                ? ((toFinite(book.asks[0].price) - toFinite(book.bids[0].price)) * 100).toFixed(1) + "¢"
                 : "—"}</span>
             </div>
             {book.bids.slice(0, 8).map((l, i) => (
@@ -78,14 +78,21 @@ export default function OrderbookDepth() {
 }
 
 function Row({ side, price, size, maxSize }: { side: "bid" | "ask"; price: number; size: number; maxSize: number }) {
+  const cleanPrice = toFinite(price);
+  const cleanSize = toFinite(size);
   const color = side === "bid" ? "var(--green)" : "var(--red)";
   const bg = side === "bid" ? "rgba(25,195,125,0.10)" : "rgba(255,77,79,0.10)";
-  const pct = (size / maxSize) * 100;
+  const pct = Math.min(100, (cleanSize / Math.max(1, maxSize)) * 100);
   return (
     <div style={{ position: "relative", display: "grid", gridTemplateColumns: "1fr 1fr", padding: "2px 6px" }}>
       <div style={{ position: "absolute", inset: 0, background: bg, width: `${pct}%`, [side === "bid" ? "left" : "right"]: 0 } as any} />
-      <span style={{ position: "relative", color }}>{price.toFixed(3)}</span>
-      <span style={{ position: "relative", textAlign: "right", color: "var(--fg-0)" }}>{size.toFixed(0)}</span>
+      <span style={{ position: "relative", color }}>{cleanPrice.toFixed(3)}</span>
+      <span style={{ position: "relative", textAlign: "right", color: "var(--fg-0)" }}>{cleanSize.toFixed(0)}</span>
     </div>
   );
+}
+
+function toFinite(value: unknown): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
 }

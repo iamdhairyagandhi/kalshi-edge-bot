@@ -41,3 +41,20 @@ def test_handles_one_sided_book():
     assert ob.no_best_ask == pytest.approx(0.60)  # 1 - 0.40
     assert ob.yes_best_ask == 1.0                  # no NO bids -> default
     assert ob.yes_best_ask_size == 0
+
+
+def test_parses_fractional_price_book_shape():
+    payload = {"orderbook_fp": {
+        "yes_dollars": [["0.4100", "12.00"], ["0.4200", "8.00"]],
+        "no_dollars": [["0.5700", "5.00"], ["0.5800", "7.00"]],
+    }}
+    ob = parse_orderbook("KXTEST-FP", payload)
+    assert ob is not None
+    assert ob.yes_best_bid == pytest.approx(0.42)
+    assert ob.yes_best_bid_size == 8
+    assert ob.no_best_bid == pytest.approx(0.58)
+    assert ob.no_best_bid_size == 7
+    assert ob.yes_best_ask == pytest.approx(0.42)
+    assert ob.yes_best_ask_size == 7
+    assert ob.no_best_ask == pytest.approx(0.58)
+    assert ob.no_best_ask_size == 8

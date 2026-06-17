@@ -11,7 +11,9 @@ class PortfolioSnapshot(BaseModel):
     starting_bankroll: float
     cash: float
     open_position_cost: float
+    fees_paid: float = 0.0
     realized_pnl: float
+    unrealized_pnl: float = 0.0
     bankroll: float
     n_open_positions: int
     n_open_kalshi: int
@@ -28,9 +30,21 @@ class Position(BaseModel):
     id: int
     venue: str
     ticker: str
+    condition_id: Optional[str] = None
+    market_title: Optional[str] = None
+    market_url: Optional[str] = None
+    outcome_index: Optional[int] = None
+    position_status: str = "open"
+    market_status: str = "unknown"
     side: str
     contracts: int
     avg_price: float
+    cost: float
+    current_price: Optional[float] = None
+    current_value: Optional[float] = None
+    unrealized_pnl: Optional[float] = None
+    potential_payout: float
+    max_profit: float
     opened_at: str
     closed_at: Optional[str]
     realized_pnl: float
@@ -122,6 +136,115 @@ class OrderbookSnapshot(BaseModel):
     token_id: str
     bids: List[OrderbookLevel]
     asks: List[OrderbookLevel]
+
+
+class CrossVenueRun(BaseModel):
+    run_id: str
+    scanned_at_unix: int
+    kalshi_markets: int
+    kalshi_eligible_markets: int
+    kalshi_excluded_mve: int
+    polymarket_markets: int
+    matched_markets: int
+    books_checked: int
+    candidates: int
+    min_match_score: float
+    min_spread: float
+    notes: Optional[str]
+
+
+class CrossVenueSpreadRow(BaseModel):
+    id: int
+    run_id: str
+    scanned_at_unix: int
+    kalshi_ticker: str
+    kalshi_title: str
+    polymarket_condition_id: str
+    polymarket_question: str
+    polymarket_token_id: str
+    polymarket_outcome_index: int
+    polymarket_outcome_label: str
+    match_score: float
+    kalshi_yes_bid: float
+    kalshi_yes_ask: float
+    polymarket_yes_bid: float
+    polymarket_yes_ask: float
+    valuation_spread: float
+    best_executable_spread: float
+    direction: str
+    decision: str
+    notes: Optional[str]
+
+
+class CrossVenueSnapshot(BaseModel):
+    latest_run: Optional[CrossVenueRun]
+    spreads: List[CrossVenueSpreadRow]
+
+
+class TradeDiagnosticRow(BaseModel):
+    id: int
+    recorded_unix: int
+    strategy: str
+    venue: str
+    market_id: str
+    market_title: Optional[str]
+    side: Optional[str]
+    decision: str
+    reason: str
+    metric_name: Optional[str]
+    metric_value: Optional[float]
+    threshold_value: Optional[float]
+    observed_price: Optional[float]
+    reference_price: Optional[float]
+    details: Optional[str]
+
+
+class TradeDiagnosticSummary(BaseModel):
+    strategy: str
+    venue: str
+    reason: str
+    count: int
+
+
+class TradeDiagnosticSnapshot(BaseModel):
+    summary: List[TradeDiagnosticSummary]
+    rows: List[TradeDiagnosticRow]
+
+
+class WeatherEstimateRow(BaseModel):
+    id: int
+    run_id: str
+    recorded_unix: int
+    venue: str
+    market_id: str
+    title: Optional[str]
+    city: Optional[str]
+    kind: Optional[str]
+    threshold: Optional[float]
+    comparator: Optional[str]
+    forecast_value: Optional[float]
+    sigma: Optional[float]
+    p_yes: Optional[float]
+    yes_bid: Optional[float]
+    yes_ask: Optional[float]
+    edge_yes: Optional[float]
+    edge_no: Optional[float]
+    recommendation: str
+    confidence: Optional[float]
+    ai_used: bool
+    notes: Optional[str]
+
+
+class WeatherRecommendationSummary(BaseModel):
+    recommendation: str
+    count: int
+
+
+class WeatherSnapshot(BaseModel):
+    latest_run_id: Optional[str]
+    latest_recorded_unix: Optional[int]
+    summary: List[WeatherRecommendationSummary]
+    rows: List[WeatherEstimateRow]
 
 
 class KillSwitch(BaseModel):

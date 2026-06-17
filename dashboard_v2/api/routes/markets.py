@@ -16,6 +16,22 @@ from src.clients.polymarket import PolymarketAPIError, PolymarketClient
 router = APIRouter()
 
 
+def _clean_levels(levels: Any) -> list[dict[str, float]]:
+    clean: list[dict[str, float]] = []
+    if not isinstance(levels, list):
+        return clean
+    for level in levels:
+        if not isinstance(level, dict):
+            continue
+        try:
+            price = float(level.get("price"))
+            size = float(level.get("size"))
+        except (TypeError, ValueError):
+            continue
+        clean.append({"price": price, "size": size})
+    return clean
+
+
 @router.get("/markets/polymarket/{condition_id}/book")
 def polymarket_book(condition_id: str, outcome_index: int = 0) -> Dict[str, Any]:
     """Fetch the live CLOB book for a Polymarket outcome.
@@ -34,8 +50,8 @@ def polymarket_book(condition_id: str, outcome_index: int = 0) -> Dict[str, Any]
             "outcome_index": outcome_index,
             "outcome_label": market.outcomes[outcome_index].label,
             "token_id": token_id,
-            "bids": book.get("bids", []),
-            "asks": book.get("asks", []),
+            "bids": _clean_levels(book.get("bids", [])),
+            "asks": _clean_levels(book.get("asks", [])),
         }
     except PolymarketAPIError as e:
         raise HTTPException(503, f"polymarket unreachable: {e}")

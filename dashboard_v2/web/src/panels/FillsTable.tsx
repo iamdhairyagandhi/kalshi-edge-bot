@@ -1,6 +1,6 @@
 import { useStore } from "../store";
 
-const fmt = (n: number, d = 2) => n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+const fmt = (n: number, d = 2) => Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
 
 export default function FillsTable() {
   const fills = useStore((s) => s.fills);

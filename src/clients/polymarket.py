@@ -4,7 +4,7 @@ Polymarket read-only client.
 V1 scope:
 - Markets (gamma-api): metadata, condition_id, outcome token IDs.
 - Trades by wallet (data-api): for leaderboard + consensus detection.
-- Leaderboard (lb-api): top wallets by P&L / volume.
+- Leaderboard (data-api /v1): top wallets by P&L / volume.
 - CLOB orderbook (clob.polymarket.com): used at signal time to mark
   paper fills at executable prices (NOT at the copied wallet's price).
 
@@ -64,6 +64,7 @@ class PolymarketOutcome:
     index: int           # 0 = first listed outcome, 1 = second, etc.
     label: str           # e.g. "Yes", "No", or a multi-outcome label
     token_id: str        # ERC-1155 CLOB token id (decimal string)
+    price: Optional[float] = None  # usually 1/0 after resolution
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,8 @@ class PolymarketTrade:
     price: float         # USDC per share, 0..1
     timestamp_unix: int
     tx_hash: Optional[str] = None
+    market_title: Optional[str] = None
+    outcome_label: Optional[str] = None
 
     @property
     def notional_usd(self) -> float:
@@ -225,6 +228,12 @@ class PolymarketClient:
     def get_market(self, condition_id: str) -> PolymarketMarket:
         payload = self._get_json(self.gamma_url, "/markets", {"condition_ids": condition_id})
         if not payload:
+            payload = self._get_json(
+                self.gamma_url,
+                "/markets",
+                {"condition_ids": condition_id, "closed": "true"},
+            )
+        if not payload:
             raise PolymarketAPIError(f"Market not found: {condition_id}")
         return self._parse_market(payload[0])
 
@@ -233,16 +242,25 @@ class PolymarketClient:
         """Tolerate both the camelCase gamma shape and snake_case variants
         we see in fixtures. The fields here are the only ones the strategy
         depends on; we do not pretend to parse the whole gamma schema."""
-        outcomes_raw = m.get("outcomes") or m.get("outcomePrices")
+        outcomes_raw = m.get("outcomes")
+        prices_raw = m.get("outcomePrices") or m.get("outcome_prices") or []
         token_ids = m.get("clobTokenIds") or m.get("clob_token_ids") or []
         if isinstance(outcomes_raw, str):
             outcomes_raw = json.loads(outcomes_raw)
+        if isinstance(prices_raw, str):
+            prices_raw = json.loads(prices_raw)
         if isinstance(token_ids, str):
             token_ids = json.loads(token_ids)
         outcomes: List[PolymarketOutcome] = []
         for i, label in enumerate(outcomes_raw or []):
             tid = str(token_ids[i]) if i < len(token_ids) else ""
-            outcomes.append(PolymarketOutcome(index=i, label=str(label), token_id=tid))
+            price = None
+            if i < len(prices_raw):
+                try:
+                    price = float(prices_raw[i])
+                except (TypeError, ValueError):
+                    price = None
+            outcomes.append(PolymarketOutcome(index=i, label=str(label), token_id=tid, price=price))
         return PolymarketMarket(
             condition_id=str(m.get("conditionId") or m.get("condition_id") or ""),
             question_id=m.get("questionId") or m.get("question_id"),
@@ -293,10 +311,12 @@ class PolymarketClient:
             price=float(t.get("price", 0.0) or 0.0),
             timestamp_unix=int(t.get("timestamp", t.get("timestamp_unix", 0)) or 0),
             tx_hash=t.get("transactionHash") or t.get("tx_hash"),
+            market_title=t.get("title") or t.get("market_title"),
+            outcome_label=t.get("outcome") or t.get("outcome_label"),
         )
 
     # ------------------------------------------------------------------
-    # Leaderboard (lb-api)
+    # Leaderboard (data-api /v1)
     # ------------------------------------------------------------------
     def get_leaderboard(
         self,
@@ -309,5 +329,21 @@ class PolymarketClient:
         own ranking for cohort selection — `signals.smart_money` re-ranks
         these using its own criteria (Sharpe + min trades + recency etc.)
         and treats the leaderboard as a candidate pool only."""
-        params = {"window": window, "metric": metric, "limit": limit}
-        return self._get_json(self.leaderboard_url, "/leaderboard", params)
+        period_map = {
+            "day": "DAY",
+            "week": "WEEK",
+            "month": "MONTH",
+            "all": "ALL",
+        }
+        order_map = {
+            "profit": "PNL",
+            "pnl": "PNL",
+            "volume": "VOL",
+            "vol": "VOL",
+        }
+        params = {
+            "timePeriod": period_map.get(window.lower(), window.upper()),
+            "orderBy": order_map.get(metric.lower(), metric.upper()),
+            "limit": min(max(int(limit), 1), 50),
+        }
+        return self._get_json(self.leaderboard_url, "/v1/leaderboard", params)
