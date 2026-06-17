@@ -236,6 +236,10 @@ export type SoccerBetBuilderQuote = {
   kelly_fraction: number | null;
   recommendation: string;
   notes: string | null;
+  safety_score: number;
+  risk_level: string;
+  risk_flags: string[];
+  ai_review: string | null;
 };
 
 export type SoccerOddsLeg = {
@@ -250,6 +254,94 @@ export type SoccerOddsForFixture = {
   fixture_id: string;
   legs: SoccerOddsLeg[];
   fetched_at_unix: number;
+};
+
+export type SoccerBookPrice = {
+  book: string;
+  decimal: number;
+};
+
+export type SoccerMarketEdge = {
+  market_group: string;
+  market_key: string;
+  selection: string;
+  label: string;
+  model_probability: number;
+  fair_decimal_odds: number;
+  best_decimal: number | null;
+  best_book: string | null;
+  implied_probability: number | null;
+  edge: number | null;
+  kelly_fraction: number;
+  recommendation: string;
+  book_count: number;
+  prices: SoccerBookPrice[];
+};
+
+export type SoccerParlayBlueprint = {
+  label: string;
+  legs: SoccerBetLeg[];
+  fair_probability: number;
+  fair_decimal_odds: number;
+  correlation_factor: number;
+  safety_score: number;
+  risk_level: string;
+  risk_flags: string[];
+};
+
+export type SoccerEdgeBoard = {
+  fixture_id: string;
+  generated_at_unix: number;
+  model_ready: boolean;
+  odds_available: boolean;
+  expected_home_goals: number | null;
+  expected_away_goals: number | null;
+  market_edges: SoccerMarketEdge[];
+  parlay_blueprints: SoccerParlayBlueprint[];
+  notes: string[];
+};
+
+export type SoccerBetslipLeg = {
+  kind: string;
+  label: string;
+  params: Record<string, unknown>;
+  model_probability: number | null;
+  fair_decimal_odds: number | null;
+  best_decimal: number | null;
+  best_book: string | null;
+  edge: number | null;
+};
+
+export type SoccerBetslip = {
+  slip_id: string;
+  fixture_id: string;
+  match_label: string;
+  kickoff_unix: number;
+  slip_type: string;
+  title: string;
+  legs: SoccerBetslipLeg[];
+  fair_probability: number;
+  fair_decimal_odds: number;
+  book_decimal_odds: number | null;
+  minimum_acceptable_decimal: number;
+  edge: number | null;
+  kelly_fraction: number;
+  stake_usd: number;
+  safety_score: number;
+  risk_level: string;
+  risk_flags: string[];
+  confidence: number;
+  reasons: string[];
+  warnings: string[];
+};
+
+export type SoccerBetslipBatch = {
+  generated_at_unix: number;
+  bankroll: number;
+  max_slips: number;
+  total_suggested_stake_usd: number;
+  slips: SoccerBetslip[];
+  notes: string[];
 };
 
 export type SoccerCalibrationRow = {
@@ -306,6 +398,14 @@ export const api = {
                 teams: number;
                 decay_per_day: number;
               }>("/api/soccer/fit-statsbomb", body || {}),
+  soccerIngestOddsFixtures: () => postJSON<{
+                ok: boolean;
+                sport_key: string;
+                events_seen: number;
+                fixtures_added: number;
+                unmatched: number;
+                odds_api_key_configured: boolean;
+              }>("/api/soccer/ingest-odds-fixtures", {}),
   soccerTeams:    () => getJSON<SoccerTeam[]>("/api/soccer/teams"),
   soccerFixtures: () => getJSON<SoccerFixture[]>("/api/soccer/fixtures"),
   soccerMatch:    (fixtureId: string, nSims = 5000) =>
@@ -321,6 +421,16 @@ export const api = {
               getJSON<SoccerOddsForFixture>(
                 `/api/soccer/odds/${encodeURIComponent(fixtureId)}${legs ? `?legs=${encodeURIComponent(legs)}` : ""}`,
               ),
+  soccerEdgeBoard:(fixtureId: string, nSims = 8000) =>
+              getJSON<SoccerEdgeBoard>(
+                `/api/soccer/edge-board/${encodeURIComponent(fixtureId)}?n_sims=${nSims}`,
+              ),
+  soccerBetslips:(maxSlips = 12, bankroll?: number, minEdge?: number) => {
+              const qs = new URLSearchParams({ max_slips: String(maxSlips) });
+              if (bankroll != null) qs.set("bankroll", String(bankroll));
+              if (minEdge != null) qs.set("min_edge", String(minEdge));
+              return getJSON<SoccerBetslipBatch>(`/api/soccer/betslips?${qs.toString()}`);
+            },
   soccerCalibration: () => getJSON<SoccerCalibrationRow[]>("/api/soccer/calibration"),
 };
 
@@ -335,23 +445,47 @@ export class StreamClient {
   private ws: WebSocket | null = null;
   private retry = 0;
   private dead = false;
+  private watchdog: number | null = null;
   constructor(private onEvent: (e: StreamEvent) => void, private onStatus: (alive: boolean) => void) {}
   connect() {
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${proto}//${window.location.host}/ws`;
     const ws = new WebSocket(url);
     this.ws = ws;
-    ws.onopen = () => { this.retry = 0; this.onStatus(true); };
+    ws.onopen = () => {
+      this.retry = 0;
+      this.markAlive();
+    };
     ws.onmessage = (m) => {
+      this.markAlive();
       try { this.onEvent(JSON.parse(m.data)); } catch {}
     };
     ws.onclose = () => {
-      this.onStatus(false);
       if (this.dead) return;
+      this.clearWatchdog();
+      this.onStatus(false);
       this.retry = Math.min(this.retry + 1, 6);
       setTimeout(() => this.connect(), 500 * 2 ** this.retry);
     };
     ws.onerror = () => ws.close();
   }
-  close() { this.dead = true; this.ws?.close(); }
+  close() {
+    this.dead = true;
+    this.clearWatchdog();
+    this.ws?.close();
+  }
+  private markAlive() {
+    if (this.dead) return;
+    this.onStatus(true);
+    this.clearWatchdog();
+    this.watchdog = window.setTimeout(() => {
+      if (!this.dead) this.onStatus(false);
+    }, 35000);
+  }
+  private clearWatchdog() {
+    if (this.watchdog != null) {
+      window.clearTimeout(this.watchdog);
+      this.watchdog = null;
+    }
+  }
 }

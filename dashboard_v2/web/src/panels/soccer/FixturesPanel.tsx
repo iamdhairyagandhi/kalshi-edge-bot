@@ -7,6 +7,7 @@ type Props = {
   empty: boolean;
   onSeedDemo: () => void;
   onFitReal: () => void;
+  onLoadOddsFixtures: () => void;
   fitting: boolean;
   fitInfo: string | null;
   seedError: string | null;
@@ -25,7 +26,7 @@ function fmtTime(unix: number): string {
 }
 
 export default function FixturesPanel({
-  fixtures, selectedId, onSelect, empty, onSeedDemo, onFitReal, fitting, fitInfo, seedError,
+  fixtures, selectedId, onSelect, empty, onSeedDemo, onFitReal, onLoadOddsFixtures, fitting, fitInfo, seedError,
 }: Props) {
   return (
     <div className="panel">
@@ -45,13 +46,24 @@ export default function FixturesPanel({
                 disabled={fitting}
                 onClick={onFitReal}
                 style={{
-                  background: "rgba(80,180,255,0.18)", color: "var(--blue)",
+                  background: "rgba(80,180,255,0.18)", color: "var(--cyan)",
                   border: "1px solid rgba(80,180,255,0.45)",
                   padding: "4px 12px", borderRadius: 2, fontFamily: "var(--mono)",
                   fontSize: 11, cursor: fitting ? "wait" : "pointer", letterSpacing: "0.1em",
                   opacity: fitting ? 0.5 : 1,
                 }}
               >{fitting ? "FETCHING…" : "FIT REAL DATA (WC18/WC22/EURO20/EURO24)"}</button>
+              <button
+                disabled={fitting}
+                onClick={onLoadOddsFixtures}
+                style={{
+                  background: "rgba(255,180,40,0.18)", color: "var(--amber)",
+                  border: "1px solid rgba(255,180,40,0.45)",
+                  padding: "4px 12px", borderRadius: 2, fontFamily: "var(--mono)",
+                  fontSize: 11, cursor: fitting ? "wait" : "pointer", letterSpacing: "0.1em",
+                  opacity: fitting ? 0.5 : 1,
+                }}
+              >LOAD REAL FIXTURES</button>
               <button
                 disabled={fitting}
                 onClick={onSeedDemo}
@@ -68,51 +80,76 @@ export default function FixturesPanel({
             <span className="dim" style={{ fontSize: 11 }}>
               <strong>FIT REAL DATA</strong> pulls 230 matches from StatsBomb's open-data
               (WC 2018, WC 2022, Euro 2020, Euro 2024) and refits Dixon-Coles + Elo on real results.
-              Free, takes ~5s on a warm cache. <strong>SEED DEMO</strong> uses synthetic priors only.
+              It does not create fixtures. <strong>LOAD REAL FIXTURES</strong> uses The Odds API and only
+              inserts events whose teams match the fitted model. <strong>SEED DEMO</strong> is synthetic.
             </span>
           </div>
         ) : (
-          <table className="tight">
-            <thead>
-              <tr>
-                <th>KICKOFF</th>
-                <th>MATCH</th>
-                <th className="right">H</th>
-                <th className="right">D</th>
-                <th className="right">A</th>
-                <th className="right">O2.5</th>
-                <th className="right">BTTS</th>
-              </tr>
-            </thead>
-            <tbody>
-              {fixtures.map((f) => {
-                const sel = selectedId === f.fixture_id;
-                return (
-                  <tr
-                    key={f.fixture_id}
-                    onClick={() => onSelect(f.fixture_id)}
-                    style={{
-                      cursor: "pointer",
-                      background: sel ? "rgba(80,180,255,0.10)" : undefined,
-                    }}
-                  >
-                    <td className="mono dim" style={{ fontSize: 11 }}>{fmtTime(f.kickoff_unix)}</td>
-                    <td className="mono">
-                      {f.home_team_name || f.home_team_id} <span className="dim">vs</span>{" "}
-                      {f.away_team_name || f.away_team_id}
-                    </td>
-                    <td className="right mono">{fmtPct(f.home_win)}</td>
-                    <td className="right mono dim">{fmtPct(f.draw)}</td>
-                    <td className="right mono">{fmtPct(f.away_win)}</td>
-                    <td className="right mono dim">{fmtPct(f.over_2_5)}</td>
-                    <td className="right mono dim">{fmtPct(f.btts_yes)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+          <div style={{ display: "grid", gap: 6, padding: 8 }}>
+            {fixtures.map((f) => {
+              const sel = selectedId === f.fixture_id;
+              const home = f.home_team_name || f.home_team_id;
+              const away = f.away_team_name || f.away_team_id;
+              return (
+                <button
+                  key={f.fixture_id}
+                  onClick={() => onSelect(f.fixture_id)}
+                  style={{
+                    textAlign: "left",
+                    background: sel ? "rgba(80,180,255,0.13)" : "rgba(255,255,255,0.02)",
+                    border: `1px solid ${sel ? "var(--cyan-dim)" : "var(--border)"}`,
+                    borderRadius: 4,
+                    padding: "8px 9px",
+                    cursor: "pointer",
+                    color: "var(--fg-0)",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+                    <div className="mono dim" style={{ fontSize: 10 }}>{fmtTime(f.kickoff_unix)}</div>
+                    <div className="mono" style={{ fontSize: 10, color: sel ? "var(--cyan)" : "var(--fg-2)" }}>
+                      {f.competition?.replace("soccer_", "") || "fixture"}
+                    </div>
+                  </div>
+                  <div className="mono" style={{ fontSize: 14, marginTop: 5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {home} <span className="dim">vs</span> {away}
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 4, marginTop: 8 }}>
+                    <Chip label="H" value={fmtPct(f.home_win)} hot={sel} />
+                    <Chip label="D" value={fmtPct(f.draw)} />
+                    <Chip label="A" value={fmtPct(f.away_win)} />
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginTop: 4 }}>
+                    <Chip label="O2.5" value={fmtPct(f.over_2_5)} muted />
+                    <Chip label="BTTS" value={fmtPct(f.btts_yes)} muted />
+                  </div>
+                </button>
+              );
+            })}
+          </div>
         )}
       </div>
     </div>
+  );
+}
+
+function Chip({ label, value, hot, muted }: { label: string; value: string; hot?: boolean; muted?: boolean }) {
+  return (
+    <span
+      className="mono"
+      style={{
+        display: "flex",
+        justifyContent: "space-between",
+        gap: 5,
+        border: "1px solid var(--border)",
+        background: hot ? "rgba(24,210,224,0.12)" : "var(--bg-3)",
+        color: muted ? "var(--fg-2)" : "var(--fg-1)",
+        padding: "3px 5px",
+        borderRadius: 2,
+        fontSize: 10,
+      }}
+    >
+      <span className="dim">{label}</span>
+      <span>{value}</span>
+    </span>
   );
 }

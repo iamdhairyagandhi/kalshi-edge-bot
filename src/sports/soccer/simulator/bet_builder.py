@@ -101,6 +101,20 @@ LEG_PREDICATES: Dict[str, LegPredicate] = {
 }
 
 
+HIGH_VARIANCE_LEGS = {
+    "correct_score",
+    "first_scorer",
+    "last_scorer",
+    "player_red",
+}
+
+MEDIUM_VARIANCE_LEGS = {
+    "anytime_scorer",
+    "player_yellow",
+    "total_cards",
+}
+
+
 # ----------------------------------------------------------------------
 # pricing
 # ----------------------------------------------------------------------
@@ -201,6 +215,18 @@ def price_bet_builder(
             rec = "no_bet"
             notes.append("Book price implies no edge.")
 
+    safety_score, risk_level, risk_flags = _safety_assessment(
+        legs=legs,
+        leg_probs=leg_probs,
+        joint_probability=p_joint,
+        correlation_factor=corr_factor,
+        edge=edge,
+        book_decimal_odds=book_decimal_odds,
+    )
+    if rec == "bet" and risk_level in {"high", "lottery"}:
+        rec = "risky_edge"
+        notes.append(f"Positive edge but {risk_level} parlay risk.")
+
     return BetBuilderQuote(
         fair_probability=p_joint,
         fair_decimal_odds=fair_odds,
@@ -213,4 +239,80 @@ def price_bet_builder(
         kelly_fraction=kelly,
         recommendation=rec,
         notes="; ".join(notes) if notes else None,
+        safety_score=safety_score,
+        risk_level=risk_level,
+        risk_flags=risk_flags,
     )
+
+
+def _safety_assessment(
+    *,
+    legs: Sequence[BetLeg],
+    leg_probs: Sequence[float],
+    joint_probability: float,
+    correlation_factor: float,
+    edge: Optional[float],
+    book_decimal_odds: Optional[float],
+) -> tuple[float, str, List[str]]:
+    score = 100.0
+    flags: List[str] = []
+
+    n_legs = len(legs)
+    if n_legs >= 5:
+        score -= 30
+        flags.append("too many legs for a safer parlay")
+    elif n_legs == 4:
+        score -= 18
+        flags.append("four-leg parlay has elevated variance")
+    elif n_legs == 3:
+        score -= 8
+
+    high_var = sum(1 for l in legs if l.kind in HIGH_VARIANCE_LEGS)
+    med_var = sum(1 for l in legs if l.kind in MEDIUM_VARIANCE_LEGS)
+    if high_var:
+        score -= 22 * high_var
+        flags.append("contains high-variance prop leg")
+    if med_var:
+        score -= 8 * med_var
+
+    if joint_probability < 0.03:
+        score -= 35
+        flags.append("joint probability is lottery-ticket low")
+    elif joint_probability < 0.08:
+        score -= 22
+        flags.append("joint probability is low")
+    elif joint_probability < 0.15:
+        score -= 10
+
+    weak_legs = [p for p in leg_probs if p < 0.30]
+    if weak_legs:
+        score -= min(24, 8 * len(weak_legs))
+        flags.append("one or more legs are individually fragile")
+
+    if correlation_factor != correlation_factor:
+        score -= 10
+    elif correlation_factor < 0.65:
+        score -= 18
+        flags.append("legs are negatively correlated")
+    elif correlation_factor > 2.5:
+        score -= 12
+        flags.append("parlay depends heavily on correlation")
+
+    if book_decimal_odds is not None:
+        if edge is None or edge <= 0:
+            score -= 24
+            flags.append("no positive model edge versus book odds")
+        elif edge < 0.05:
+            score -= 10
+            flags.append("edge is thin after model uncertainty")
+
+    score = max(0.0, min(100.0, score))
+    if score >= 78:
+        level = "safer"
+    elif score >= 60:
+        level = "moderate"
+    elif score >= 38:
+        level = "high"
+    else:
+        level = "lottery"
+    return score, level, flags

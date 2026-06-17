@@ -144,6 +144,8 @@ class Settings:
     soccer_kelly_fraction: float = field(default_factory=lambda: _env_float("SOCCER_KELLY_FRACTION", 0.25))
     soccer_kelly_cap: float = field(default_factory=lambda: _env_float("SOCCER_KELLY_CAP", 0.02))
     soccer_decay_per_day: float = field(default_factory=lambda: _env_float("SOCCER_DECAY_PER_DAY", 0.0019))  # ~half-life 1y
+    soccer_ai_review_enabled: bool = field(default_factory=lambda: _env_bool("SOCCER_AI_REVIEW_ENABLED", True))
+    soccer_ai_model: str = field(default_factory=lambda: _env("SOCCER_AI_MODEL", "gpt-5-mini"))
 
     # The Odds API (https://the-odds-api.com)
     odds_api_key: Optional[str] = field(default_factory=lambda: _env("ODDS_API_KEY"))

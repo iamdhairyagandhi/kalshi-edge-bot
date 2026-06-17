@@ -292,6 +292,70 @@ table.tight tr:hover td { background: var(--bg-3); }
   grid-template-rows: 260px minmax(300px, 1fr);
 }
 
+/* ============ Soccer betting desk ============ */
+.soccer-desk {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(330px, 0.78fr) minmax(520px, 1.34fr) minmax(390px, 0.95fr);
+  grid-template-rows: 62px minmax(250px, 0.78fr) minmax(315px, 1fr) minmax(230px, 0.62fr);
+  grid-template-areas:
+    "rail status slip"
+    "rail match  slip"
+    "rail edge   slip"
+    "rail builder calibration";
+  gap: 8px;
+  padding: 8px;
+  overflow: auto;
+}
+
+.soccer-desk > section {
+  min-width: 0;
+  min-height: 0;
+}
+
+.soccer-rail { grid-area: rail; }
+.soccer-status { grid-area: status; }
+.soccer-match { grid-area: match; }
+.soccer-edge { grid-area: edge; }
+.soccer-slip { grid-area: slip; }
+.soccer-builder { grid-area: builder; }
+.soccer-calibration { grid-area: calibration; }
+
+.soccer-status-card {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background:
+    linear-gradient(90deg, rgba(24, 210, 224, 0.10), transparent 42%),
+    linear-gradient(180deg, var(--bg-1), var(--bg-2));
+}
+
+.soccer-status-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(72px, auto));
+  gap: 18px;
+  align-items: center;
+  text-align: right;
+}
+
+.soccer-rail .panel-body {
+  overflow: auto;
+}
+
+.soccer-slip .panel-body {
+  padding: 10px;
+}
+
+.soccer-builder .panel-body {
+  min-height: 0;
+}
+
 @media (max-width: 1100px) {
   body { overflow: auto; }
   .workspace { height: auto; min-height: calc(100vh - 48px); overflow: visible; }
@@ -303,6 +367,27 @@ table.tight tr:hover td { background: var(--bg-3); }
   }
   .span-2,
   .span-3 { grid-column: span 1; }
+  .soccer-desk {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto;
+    grid-template-areas:
+      "status"
+      "rail"
+      "match"
+      "edge"
+      "slip"
+      "builder"
+      "calibration";
+    overflow: visible;
+  }
+  .soccer-status-card {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .soccer-status-metrics {
+    width: 100%;
+    text-align: left;
+  }
 }
 
 /* ============ Misc ============ */

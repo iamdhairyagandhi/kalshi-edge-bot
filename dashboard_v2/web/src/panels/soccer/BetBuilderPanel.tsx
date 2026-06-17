@@ -7,7 +7,7 @@
  * factor, edge vs book, and Kelly stake.
  */
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   SoccerBetLeg,
   SoccerBetBuilderQuote,
@@ -15,7 +15,12 @@ import {
   api,
 } from "../../api/client";
 
-type Props = { match: SoccerMatchSummary | null };
+type Props = {
+  match: SoccerMatchSummary | null;
+  presetLegs?: SoccerBetLeg[];
+  presetKey?: number;
+  presetBookOdds?: number | null;
+};
 
 type LegDraft = {
   id: number;
@@ -158,7 +163,7 @@ function legParamEditor(
   }
 }
 
-export default function BetBuilderPanel({ match }: Props) {
+export default function BetBuilderPanel({ match, presetLegs, presetKey, presetBookOdds }: Props) {
   const [legs, setLegs] = useState<LegDraft[]>([]);
   const [bookOdds, setBookOdds] = useState<string>("");
   const [nSims, setNSims] = useState<number>(10000);
@@ -167,6 +172,19 @@ export default function BetBuilderPanel({ match }: Props) {
   const [err, setErr] = useState<string | null>(null);
 
   const canPrice = !!match && legs.length > 0;
+
+  useEffect(() => {
+    if (!presetLegs || presetLegs.length === 0) return;
+    setLegs(presetLegs.map((l, i) => ({
+      id: Date.now() + i,
+      kind: l.kind,
+      params: l.params as Record<string, string | number>,
+      label: l.label || l.kind,
+    })));
+    setQuote(null);
+    setErr(null);
+    setBookOdds(presetBookOdds ? String(presetBookOdds) : "");
+  }, [presetKey, presetLegs]);
 
   function addLeg(kind: string) {
     if (!match) return;
@@ -203,6 +221,14 @@ export default function BetBuilderPanel({ match }: Props) {
     if (!quote) return "var(--fg)";
     if (quote.recommendation === "bet") return "var(--green)";
     if (quote.recommendation === "thin_edge") return "var(--amber)";
+    if (quote.recommendation === "risky_edge") return "var(--amber)";
+    return "var(--red)";
+  }, [quote]);
+
+  const riskColor = useMemo(() => {
+    if (!quote) return "var(--fg)";
+    if (quote.risk_level === "safer") return "var(--green)";
+    if (quote.risk_level === "moderate") return "var(--amber)";
     return "var(--red)";
   }, [quote]);
 
@@ -304,6 +330,10 @@ export default function BetBuilderPanel({ match }: Props) {
               <Stat label="CORRELATION FACTOR"
                     value={isFinite(quote.correlation_factor) ? quote.correlation_factor.toFixed(3) : "—"}
                     sub={`indep prod ${quote.independent_product.toExponential(2)}`} />
+              <Stat label="SAFETY SCORE"
+                    value={`${quote.safety_score.toFixed(0)}/100`}
+                    sub={quote.risk_level.toUpperCase()}
+                    color={riskColor} />
               {quote.book_decimal_odds != null && (
                 <>
                   <Stat label="BOOK ODDS"
@@ -320,6 +350,26 @@ export default function BetBuilderPanel({ match }: Props) {
                 fontFamily: "var(--mono)", fontSize: 12, color: recColor,
                 letterSpacing: "0.15em", textAlign: "center", marginTop: 6,
               }}>{quote.recommendation.toUpperCase()}</div>
+              {quote.risk_flags.length > 0 ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  {quote.risk_flags.map((flag) => (
+                    <div key={flag} className="mono" style={{ color: "var(--amber)", fontSize: 10 }}>
+                      {flag}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {quote.ai_review ? (
+                <div style={{
+                  border: "1px solid var(--bg-4)", borderRadius: 2, padding: "7px 9px",
+                  background: "rgba(80,180,255,0.08)",
+                }}>
+                  <div className="mono dim" style={{ fontSize: 10, letterSpacing: "0.15em", marginBottom: 4 }}>
+                    AI RISK REVIEW
+                  </div>
+                  <div className="mono" style={{ fontSize: 11, lineHeight: 1.45 }}>{quote.ai_review}</div>
+                </div>
+              ) : null}
               {quote.notes ? <div className="dim mono" style={{ fontSize: 11 }}>{quote.notes}</div> : null}
               <div className="dim mono" style={{ fontSize: 10 }}>{quote.n_sims.toLocaleString()} sims</div>
             </div>

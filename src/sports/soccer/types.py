@@ -157,3 +157,7 @@ class BetBuilderQuote:
     kelly_fraction: Optional[float] = None
     recommendation: str = "no_bet"
     notes: Optional[str] = None
+    safety_score: float = 0.0
+    risk_level: str = "unknown"
+    risk_flags: List[str] = field(default_factory=list)
+    ai_review: Optional[str] = None
