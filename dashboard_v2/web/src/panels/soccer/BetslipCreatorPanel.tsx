@@ -33,18 +33,42 @@ function typeColor(type: string): string {
   return "var(--cyan)";
 }
 
+type Horizon = "today" | "week" | "all";
+
+function horizonHours(h: Horizon): number | undefined {
+  if (h === "all") return undefined;
+  if (h === "week") return 24 * 7;
+  // "today": seconds remaining until local midnight, rounded up to whole hours.
+  const now = new Date();
+  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+  const hours = Math.max(1, Math.ceil((end.getTime() - now.getTime()) / 3_600_000));
+  return hours;
+}
+
+function horizonLabel(h: Horizon): string {
+  if (h === "today") return "TODAY";
+  if (h === "week") return "NEXT 7D";
+  return "ALL UPCOMING";
+}
+
 export default function BetslipCreatorPanel({ onUseLegs, onSelectFixture }: Props) {
   const [batch, setBatch] = useState<SoccerBetslipBatch | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [bankroll, setBankroll] = useState("1000");
   const [minEdge, setMinEdge] = useState("0.03");
+  const [horizon, setHorizon] = useState<Horizon>("today");
 
   async function create() {
     setLoading(true);
     setErr(null);
     try {
-      const b = await api.soccerBetslips(14, parseFloat(bankroll), parseFloat(minEdge));
+      const b = await api.soccerBetslips(
+        14,
+        parseFloat(bankroll),
+        parseFloat(minEdge),
+        horizonHours(horizon),
+      );
       setBatch(b);
     } catch (e: any) {
       setErr(String(e));
@@ -57,7 +81,11 @@ export default function BetslipCreatorPanel({ onUseLegs, onSelectFixture }: Prop
     <div className="panel">
       <div className="panel-header">
         <span><span className="ind" /> &nbsp; BETSLIP CREATOR</span>
-        <span className="mono dim">{batch ? `${batch.slips.length} slips · ${money(batch.total_suggested_stake_usd)}` : "scanner"}</span>
+        <span className="mono dim">
+          {batch
+            ? `${batch.slips.length} slips · ${money(batch.total_suggested_stake_usd)} · ${horizonLabel(horizon)}`
+            : `scanner · ${horizonLabel(horizon)}`}
+        </span>
       </div>
       <div className="panel-body" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -65,6 +93,16 @@ export default function BetslipCreatorPanel({ onUseLegs, onSelectFixture }: Prop
           <Input value={bankroll} onChange={setBankroll} width={90} />
           <label className="mono dim" style={{ fontSize: 11 }}>min edge</label>
           <Input value={minEdge} onChange={setMinEdge} width={70} />
+          <div style={{ display: "flex", gap: 4 }}>
+            {(["today", "week", "all"] as Horizon[]).map((h) => (
+              <button
+                key={h}
+                onClick={() => setHorizon(h)}
+                disabled={loading}
+                style={pillStyle(horizon === h)}
+              >{horizonLabel(h)}</button>
+            ))}
+          </div>
           <button
             onClick={create}
             disabled={loading}
@@ -193,6 +231,20 @@ function buttonStyle(kind: "ghost" | "primary"): CSSProperties {
     borderRadius: 2,
     fontFamily: "var(--mono)",
     fontSize: 10,
+    cursor: "pointer",
+  };
+}
+
+function pillStyle(active: boolean): CSSProperties {
+  return {
+    background: active ? "rgba(80,180,255,0.18)" : "var(--bg-3)",
+    color: active ? "var(--cyan)" : "var(--fg-2)",
+    border: `1px solid ${active ? "var(--cyan-dim)" : "var(--border)"}`,
+    padding: "3px 9px",
+    borderRadius: 2,
+    fontFamily: "var(--mono)",
+    fontSize: 10,
+    letterSpacing: "0.08em",
     cursor: "pointer",
   };
 }

@@ -78,3 +78,29 @@ def test_bet_builder_409_when_engine_uninitialized(client):
         "legs": [{"kind": "btts", "params": {"side": "yes"}}],
     })
     assert r.status_code == 409
+
+
+def test_betslips_today_horizon_filters_out_far_future_fixtures(client):
+    """A small horizon (1h) should filter out the demo fixtures (which are
+    seeded ~3 days out) entirely, leaving 0 slips. With no horizon (or a
+    large horizon) the same call returns the same demo fixtures."""
+    seed = client.post("/api/soccer/seed-demo").json()
+    assert seed["fit_source"] == "demo"
+
+    r = client.get("/api/soccer/betslips", params={"max_slips": 5, "horizon_hours": 1})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["slips"] == []
+    assert any("horizon=1h" in n for n in body["notes"]), body["notes"]
+
+    r = client.get("/api/soccer/betslips", params={"max_slips": 5, "horizon_hours": 24 * 7})
+    assert r.status_code == 200
+    week = r.json()
+    # demo fixtures exist a few days out; week horizon should keep them.
+    assert any("horizon=" in n for n in week["notes"])
+
+    r = client.get("/api/soccer/betslips", params={"max_slips": 5})
+    assert r.status_code == 200
+    full = r.json()
+    # No horizon param -> no horizon note.
+    assert not any(n.startswith("horizon=") for n in full["notes"])

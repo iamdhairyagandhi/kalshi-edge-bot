@@ -873,6 +873,7 @@ def betslips(
     bankroll: Optional[float] = None,
     min_edge: Optional[float] = None,
     n_sims: int = 2500,
+    horizon_hours: Optional[int] = None,
 ) -> SoccerBetslipBatchOut:
     eng = _engine(request)
     eng.ensure_ready_from_store()
@@ -883,9 +884,21 @@ def betslips(
     bankroll_value = float(bankroll if bankroll is not None else settings.starting_bankroll)
     edge_floor = float(min_edge if min_edge is not None else settings.soccer_min_edge)
     max_slips = max(1, min(int(max_slips), 40))
-    rows = eng.store.fixtures_upcoming(int(time.time()) - 3600, limit=80)
+    now_unix = int(time.time())
+    rows = eng.store.fixtures_upcoming(now_unix - 3600, limit=80)
+    horizon_label: Optional[str] = None
+    if horizon_hours is not None and horizon_hours > 0:
+        horizon = max(1, min(int(horizon_hours), 24 * 30))
+        cutoff = now_unix + horizon * 3600
+        before = len(rows)
+        rows = [r for r in rows if int(r["kickoff_unix"]) <= cutoff]
+        horizon_label = (
+            f"horizon={horizon}h kept {len(rows)}/{before} fixture(s)"
+        )
     events: List[Dict[str, object]] = []
     notes: List[str] = []
+    if horizon_label:
+        notes.append(horizon_label)
     if settings.odds_api_key:
         try:
             with OddsApiClient(api_key=settings.odds_api_key, region=settings.odds_api_region) as client:

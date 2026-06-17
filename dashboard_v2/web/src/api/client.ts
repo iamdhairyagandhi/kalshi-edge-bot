@@ -425,10 +425,11 @@ export const api = {
               getJSON<SoccerEdgeBoard>(
                 `/api/soccer/edge-board/${encodeURIComponent(fixtureId)}?n_sims=${nSims}`,
               ),
-  soccerBetslips:(maxSlips = 12, bankroll?: number, minEdge?: number) => {
+  soccerBetslips:(maxSlips = 12, bankroll?: number, minEdge?: number, horizonHours?: number) => {
               const qs = new URLSearchParams({ max_slips: String(maxSlips) });
               if (bankroll != null) qs.set("bankroll", String(bankroll));
               if (minEdge != null) qs.set("min_edge", String(minEdge));
+              if (horizonHours != null) qs.set("horizon_hours", String(Math.max(1, Math.round(horizonHours))));
               return getJSON<SoccerBetslipBatch>(`/api/soccer/betslips?${qs.toString()}`);
             },
   soccerCalibration: () => getJSON<SoccerCalibrationRow[]>("/api/soccer/calibration"),
