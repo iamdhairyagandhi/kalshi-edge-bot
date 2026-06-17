@@ -19,6 +19,7 @@ function money(x: number): string {
 function riskColor(level: string): string {
   if (level === "safer") return "var(--green)";
   if (level === "moderate") return "var(--amber)";
+  if (level === "scout") return "var(--cyan)";
   return "var(--red)";
 }
 
@@ -159,11 +160,26 @@ export default function BetslipCreatorPanel({ onUseLegs, onSelectFixture }: Prop
 }
 
 function SlipCard({ slip, onOpen, onLoad }: { slip: SoccerBetslip; onOpen: () => void; onLoad: () => void }) {
+  const scout = slip.scout_only === true;
   return (
-    <div style={{ border: "1px solid var(--border)", borderRadius: 4, background: "rgba(255,255,255,0.02)", padding: "9px 10px" }}>
+    <div style={{
+      border: scout ? "1px dashed var(--cyan-dim)" : "1px solid var(--border)",
+      borderRadius: 4,
+      background: scout ? "rgba(80,180,255,0.04)" : "rgba(255,255,255,0.02)",
+      padding: "9px 10px",
+    }}>
       <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 10, alignItems: "start" }}>
         <div>
-          <div className="mono" style={{ fontSize: 12 }}>{slip.title}</div>
+          <div className="mono" style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+            {scout && (
+              <span className="mono" style={{
+                fontSize: 9, letterSpacing: "0.12em", color: "var(--cyan)",
+                border: "1px solid var(--cyan-dim)", padding: "1px 5px", borderRadius: 2,
+                background: "rgba(80,180,255,0.10)",
+              }}>SCOUT</span>
+            )}
+            {slip.title}
+          </div>
           <div className="mono dim" style={{ fontSize: 10, marginTop: 2 }}>
             {slip.match_label} · <span style={{ color: typeColor(slip.slip_type) }}>{typeLabel(slip.slip_type)}</span>
           </div>
@@ -180,7 +196,11 @@ function SlipCard({ slip, onOpen, onLoad }: { slip: SoccerBetslip; onOpen: () =>
         <Mini label="MODEL" value={pct(slip.fair_probability)} />
         <Mini label="FAIR" value={slip.fair_decimal_odds.toFixed(2)} />
         <Mini label={slip.book_decimal_odds ? "BOOK" : "MIN BOOK"} value={(slip.book_decimal_odds ?? slip.minimum_acceptable_decimal).toFixed(2)} />
-        <Mini label="STAKE" value={money(slip.stake_usd)} />
+        {scout ? (
+          <Mini label="STAKE" value="—" />
+        ) : (
+          <Mini label="STAKE" value={money(slip.stake_usd)} />
+        )}
         <Mini label="CONF" value={pct(slip.confidence)} />
       </div>
 
@@ -204,7 +224,9 @@ function SlipCard({ slip, onOpen, onLoad }: { slip: SoccerBetslip; onOpen: () =>
 
       <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 8 }}>
         <button onClick={onOpen} style={buttonStyle("ghost")}>OPEN MATCH</button>
-        <button onClick={onLoad} style={buttonStyle("primary")}>LOAD BUILDER</button>
+        <button onClick={onLoad} style={buttonStyle("primary")}>
+          {scout ? "VERIFY PRICE" : "LOAD BUILDER"}
+        </button>
       </div>
     </div>
   );

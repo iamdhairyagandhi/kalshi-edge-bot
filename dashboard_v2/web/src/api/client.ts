@@ -276,6 +276,8 @@ export type SoccerMarketEdge = {
   recommendation: string;
   book_count: number;
   prices: SoccerBookPrice[];
+  no_vig_market_prob: number | null;
+  edge_vs_market: number | null;
 };
 
 export type SoccerParlayBlueprint = {
@@ -333,6 +335,7 @@ export type SoccerBetslip = {
   confidence: number;
   reasons: string[];
   warnings: string[];
+  scout_only: boolean;
 };
 
 export type SoccerBetslipBatch = {

@@ -21,7 +21,7 @@ import logging
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import httpx
@@ -175,6 +175,8 @@ class SoccerMarketEdgeOut(BaseModel):
     recommendation: str
     book_count: int = 0
     prices: List[SoccerBookPriceOut] = Field(default_factory=list)
+    no_vig_market_prob: Optional[float] = None
+    edge_vs_market: Optional[float] = None
 
 
 class SoccerParlayBlueprintOut(BaseModel):
@@ -232,6 +234,11 @@ class SoccerBetslipOut(BaseModel):
     confidence: float = 0.0
     reasons: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
+    # scout_only=True means we have a model price but NO confirmed book
+    # quote (e.g., corners/cards markets the Odds API free tier omits).
+    # The UI should render these without a stake button and label them
+    # "SCOUT" so the user knows to manually confirm a price before betting.
+    scout_only: bool = False
 
 
 class SoccerBetslipBatchOut(BaseModel):
@@ -817,6 +824,16 @@ def edge_board(request: Request, fixture_id: str, n_sims: int = 8000) -> SoccerE
         ("BTTS", "btts", "Yes", "BTTS yes", probs["btts_yes"], None),
         ("BTTS", "btts", "No", "BTTS no", probs["btts_no"], None),
     ]
+    # Pre-build de-vig vectors per market so every selection on the same
+    # market shares one consensus probability.
+    h2h_vec = _devig_vector(event, "h2h", [(home, None), ("Draw", None), (away, None)]) if event else None
+    totals_vec = _devig_vector(event, "totals", [("Over", 2.5), ("Under", 2.5)]) if event else None
+    btts_vec = _devig_vector(event, "btts", [("Yes", None), ("No", None)]) if event else None
+    market_vec_for = {
+        "h2h": h2h_vec,
+        "totals": totals_vec,
+        "btts": btts_vec,
+    }
     edges: List[SoccerMarketEdgeOut] = []
     for group, market_key, selection, label, p_model, point in specs:
         prices = _book_prices(event, market_key, selection, point=point) if event else []
@@ -828,6 +845,7 @@ def edge_board(request: Request, fixture_id: str, n_sims: int = 8000) -> SoccerE
             min_edge=settings.soccer_min_edge,
             kelly_fraction=settings.soccer_kelly_fraction,
             kelly_cap=settings.soccer_kelly_cap,
+            market_decimal_odds=market_vec_for.get(market_key),
         )
         edges.append(SoccerMarketEdgeOut(
             market_group=group,
@@ -844,6 +862,8 @@ def edge_board(request: Request, fixture_id: str, n_sims: int = 8000) -> SoccerE
             recommendation=rep.recommendation,
             book_count=len(prices),
             prices=[SoccerBookPriceOut(book=b, decimal=d) for b, d in sorted(prices, key=lambda x: -x[1])[:6]],
+            no_vig_market_prob=rep.no_vig_market_prob,
+            edge_vs_market=rep.edge_vs_market,
         ))
 
     sims = eng.simulator().simulate(
@@ -1157,6 +1177,48 @@ def _book_prices(
     return out
 
 
+def _best_price(
+    event: Optional[Dict[str, object]],
+    market_key: str,
+    selection: str,
+    *,
+    point: Optional[float] = None,
+    prefer_pinnacle: bool = False,
+) -> Optional[float]:
+    """Best decimal across books for one (market, selection). When
+    `prefer_pinnacle=True` and Pinnacle has a price, return Pinnacle's
+    price even if another book is higher — used to build the de-vig
+    vector from a single sharp book."""
+    prices = _book_prices(event, market_key, selection, point=point)
+    if not prices:
+        return None
+    if prefer_pinnacle:
+        for b, d in prices:
+            if b.lower() == "pinnacle":
+                return d
+    return max(p for _, p in prices)
+
+
+def _devig_vector(
+    event: Optional[Dict[str, object]],
+    market_key: str,
+    selections: Sequence[tuple[str, Optional[float]]],
+    *,
+    prefer_pinnacle: bool = True,
+) -> Optional[List[float]]:
+    """Return decimal odds for every mutually-exclusive selection on a
+    market (in the order given). All selections must resolve to a price
+    for the de-vig calculation to be meaningful — if any is missing we
+    return None and the caller falls back to raw-edge mode."""
+    out: List[float] = []
+    for sel, point in selections:
+        d = _best_price(event, market_key, sel, point=point, prefer_pinnacle=prefer_pinnacle)
+        if d is None or d <= 1.0:
+            return None
+        out.append(d)
+    return out
+
+
 def _outcome_matches(outcome: Dict[str, object], selection: str, point: Optional[float]) -> bool:
     raw = str(outcome.get("name") or "").strip().lower()
     wanted = selection.strip().lower()
@@ -1319,6 +1381,20 @@ def _betslips_for_fixture(
     event = _find_odds_event(events, fixture, home, away)
     slips: List[SoccerBetslipOut] = []
 
+    # Build the de-vig vector for each market once, so every selection
+    # within a market shares the same no-vig consensus probability.
+    h2h_market = [(home, None), ("Draw", None), (away, None)]
+    totals_market = [("Over", 2.5), ("Under", 2.5)]
+    h2h_vec = _devig_vector(event, "h2h", h2h_market) if event else None
+    totals_vec = _devig_vector(event, "totals", totals_market) if event else None
+    market_vectors = {
+        ("h2h", home, None): h2h_vec,
+        ("h2h", "Draw", None): h2h_vec,
+        ("h2h", away, None): h2h_vec,
+        ("totals", "Over", 2.5): totals_vec,
+        ("totals", "Under", 2.5): totals_vec,
+    }
+
     specs = [
         ("match_result", {"side": "H"}, "h2h", home, f"{home} win", probs["home_win"], None),
         ("match_result", {"side": "D"}, "h2h", "Draw", "Draw", probs["draw"], None),
@@ -1331,21 +1407,41 @@ def _betslips_for_fixture(
         if not prices:
             continue
         best_book, best_decimal = max(prices, key=lambda x: x[1])
+        market_vec = market_vectors.get((market_key, selection, point))
         rep = report_edge(
             float(p_model),
             best_decimal,
             min_edge=min_edge,
             kelly_fraction=settings.soccer_kelly_fraction,
             kelly_cap=settings.soccer_kelly_cap,
+            market_decimal_odds=market_vec,
         )
         if rep.edge is None or rep.edge < min_edge or rep.kelly_fraction <= 0:
+            continue
+        # When we have a de-vig vector, demand the model also beats the
+        # no-vig market consensus by min_edge. Beating only the raw best
+        # book price is largely just consuming the book's vig and is the
+        # #1 trap retail bettors fall into.
+        if rep.edge_vs_market is not None and rep.edge_vs_market < min_edge:
             continue
         confidence, warnings = _single_confidence(
             p_model=float(p_model),
             edge=float(rep.edge),
             book_count=len(prices),
+            edge_vs_market=rep.edge_vs_market,
         )
         stake = round(bankroll * rep.kelly_fraction * confidence, 2)
+        reasons = [
+            f"Model {float(p_model) * 100:.1f}% vs raw market {100 / best_decimal:.1f}%.",
+            f"Best live price {best_decimal:.2f} at {best_book}; fair price {rep.fair_decimal_odds:.2f}.",
+            f"Kelly suggests {rep.kelly_fraction * 100:.2f}% bankroll before confidence haircut.",
+        ]
+        if rep.no_vig_market_prob is not None:
+            reasons.insert(
+                1,
+                f"De-vig market consensus {rep.no_vig_market_prob * 100:.1f}% "
+                f"(edge vs consensus {rep.edge_vs_market * 100:+.2f}%).",
+            )
         slips.append(SoccerBetslipOut(
             slip_id=f"{fixture['id']}:{kind}:{selection}:{point or ''}",
             fixture_id=str(fixture["id"]),
@@ -1374,11 +1470,7 @@ def _betslips_for_fixture(
             risk_level="safer" if float(p_model) >= 0.35 and rep.edge >= 0.08 else "moderate",
             risk_flags=warnings,
             confidence=confidence,
-            reasons=[
-                f"Model {float(p_model) * 100:.1f}% vs market {100 / best_decimal:.1f}%.",
-                f"Best live price {best_decimal:.2f} at {best_book}; fair price {rep.fair_decimal_odds:.2f}.",
-                f"Kelly suggests {rep.kelly_fraction * 100:.2f}% bankroll before confidence haircut.",
-            ],
+            reasons=reasons,
             warnings=warnings,
         ))
 
@@ -1408,17 +1500,17 @@ def _betslips_for_fixture(
         if bp.risk_level not in {"safer", "moderate"} or bp.fair_probability < 0.14:
             continue
         min_price = bp.fair_decimal_odds * (1.0 + max(min_edge, 0.05))
-        stake_fraction = min(settings.soccer_kelly_cap * 0.50, 0.006)
-        if bp.risk_level == "moderate":
-            stake_fraction *= 0.55
-        stake = round(bankroll * stake_fraction, 2)
+        # SGP / model parlays carry NO confirmed book price (books quote
+        # SGPs with their own correlation adjustment that we don't know).
+        # Per P0-5 review: surface as SCOUT only — zero stake until the
+        # user pastes a real SGP price into the bet builder and re-prices.
         slips.append(SoccerBetslipOut(
             slip_id=f"{fixture['id']}:parlay:{abs(hash(bp.label))}",
             fixture_id=str(fixture["id"]),
             match_label=match_label,
             kickoff_unix=int(fixture["kickoff_unix"]),
             slip_type="model_parlay",
-            title=bp.label,
+            title=f"SCOUT · {bp.label}",
             legs=[
                 SoccerBetslipLegOut(kind=l.kind, label=l.label or l.kind, params=dict(l.params))
                 for l in bp.legs
@@ -1428,21 +1520,23 @@ def _betslips_for_fixture(
             book_decimal_odds=None,
             minimum_acceptable_decimal=round(min_price, 3),
             edge=None,
-            kelly_fraction=stake_fraction,
-            stake_usd=stake,
+            kelly_fraction=0.0,
+            stake_usd=0.0,
             safety_score=bp.safety_score,
-            risk_level=bp.risk_level,
+            risk_level="scout",
             risk_flags=bp.risk_flags,
-            confidence=max(0.35, min(0.85, bp.safety_score / 100.0 - 0.08)),
+            confidence=max(0.35, min(0.75, bp.safety_score / 100.0 - 0.15)),
             reasons=[
-                "Generated from joint Monte Carlo, not independent-leg multiplication.",
+                "Generated from joint Monte Carlo (correct correlation), not independent-leg multiplication.",
                 f"Only bet if sportsbook offers at least {min_price:.2f} combined odds.",
                 f"Correlation factor {bp.correlation_factor:.2f}; fair probability {bp.fair_probability * 100:.1f}%.",
+                "SCOUT: SGP price not auto-fetched — paste into bet builder before staking.",
             ],
             warnings=[
-                "Same-game parlay book quote must be checked manually.",
+                "Books apply their own SGP correlation rebate; their quoted price will be lower than the leg product.",
                 *bp.risk_flags,
             ],
+            scout_only=True,
         ))
     return slips
 
@@ -1581,17 +1675,16 @@ def _build_stat_single(
         return None
     fair = 1.0 / p_model
     min_price = fair * (1.0 + max(min_edge, 0.05))
-    # Stat markets generally settle close to the line, so we cap stake to
-    # well under 1% bankroll until we have closing-line proof of edge.
-    stake_fraction = min(settings.soccer_kelly_cap * 0.35, 0.004)
-    if p_model < 0.55:
-        stake_fraction *= 0.75
-    stake = round(bankroll * stake_fraction, 2)
+    # No confirmed book quote for these markets on the Odds API free tier.
+    # Per pro-bettor review (P0-5): publish as SCOUT only — zero stake,
+    # so the user must paste in a real price and re-price via the bet
+    # builder before risking capital.
     safety = max(0.0, min(100.0, 50 + (p_model - 0.5) * 100))
-    risk_level = "moderate" if p_model >= 0.55 else "high"
-    risk_flags: List[str] = ["Model-only price; The Odds API free tier does not return this market."]
-    if p_model < 0.55:
-        risk_flags.append("thin empirical probability")
+    risk_level = "scout"
+    risk_flags: List[str] = [
+        "SCOUT — no confirmed sportsbook quote; the auto-tuned line maximises hit-rate, not edge.",
+        "Paste the real book price into the bet builder before staking.",
+    ]
     slug = f"{kind}:{params.get('team','total')}:{params.get('side','')}:{params.get('line','')}"
     return SoccerBetslipOut(
         slip_id=f"{fixture['id']}:{slug}",
@@ -1599,7 +1692,7 @@ def _build_stat_single(
         match_label=match_label,
         kickoff_unix=int(fixture["kickoff_unix"]),
         slip_type="model_single",
-        title=label,
+        title=f"SCOUT · {label}",
         legs=[SoccerBetslipLegOut(
             kind=kind,
             label=label,
@@ -1612,22 +1705,29 @@ def _build_stat_single(
         book_decimal_odds=None,
         minimum_acceptable_decimal=round(min_price, 3),
         edge=None,
-        kelly_fraction=stake_fraction,
-        stake_usd=stake,
+        kelly_fraction=0.0,
+        stake_usd=0.0,
         safety_score=safety,
         risk_level=risk_level,
         risk_flags=risk_flags,
-        confidence=max(0.30, min(0.70, p_model - 0.05)),
+        confidence=max(0.30, min(0.65, p_model - 0.10)),
         reasons=[
             f"Joint Monte Carlo gives {p_model * 100:.1f}% — fair price {fair:.2f}.",
             f"Only bet if the sportsbook quotes at least {min_price:.2f}.",
-            "Line auto-tuned from simulator distribution to avoid near-certain or noisy edges.",
+            "Auto-tuned line maximises hit-rate, not edge — confirm a real book quote before betting.",
         ],
         warnings=risk_flags,
+        scout_only=True,
     )
 
 
-def _single_confidence(*, p_model: float, edge: float, book_count: int) -> tuple[float, List[str]]:
+def _single_confidence(
+    *,
+    p_model: float,
+    edge: float,
+    book_count: int,
+    edge_vs_market: Optional[float] = None,
+) -> tuple[float, List[str]]:
     confidence = 0.72
     warnings: List[str] = []
     if edge >= 0.15:
@@ -1644,6 +1744,14 @@ def _single_confidence(*, p_model: float, edge: float, book_count: int) -> tuple
     if book_count < 3:
         confidence -= 0.10
         warnings.append("thin book coverage")
+    if edge_vs_market is None:
+        warnings.append("no de-vig consensus available (single-book market)")
+        confidence -= 0.05
+    elif edge_vs_market < 0.04:
+        warnings.append("edge vs de-vig consensus is thin")
+        confidence -= 0.05
+    elif edge_vs_market > 0.10:
+        confidence += 0.05
     return max(0.25, min(0.90, confidence)), warnings
 
 

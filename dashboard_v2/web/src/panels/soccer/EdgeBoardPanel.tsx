@@ -79,10 +79,16 @@ export default function EdgeBoardPanel({ match, onUseLegs }: Props) {
   }, [match?.fixture.fixture_id]);
 
   const sortedEdges = useMemo(() => {
-    return [...(board?.market_edges || [])].sort((a, b) => (b.edge ?? -99) - (a.edge ?? -99));
+    return [...(board?.market_edges || [])].sort((a, b) => {
+      // Prefer edge_vs_market (the sharp-money edge) when present;
+      // fall back to raw edge for markets without a de-vig vector.
+      const av = a.edge_vs_market ?? a.edge ?? -99;
+      const bv = b.edge_vs_market ?? b.edge ?? -99;
+      return bv - av;
+    });
   }, [board]);
 
-  const bestEdge = sortedEdges.find((e) => e.edge != null);
+  const bestEdge = sortedEdges.find((e) => (e.edge_vs_market ?? e.edge) != null);
 
   if (!match) {
     return (
@@ -102,7 +108,11 @@ export default function EdgeBoardPanel({ match, onUseLegs }: Props) {
       <div className="panel-body" style={{ display: "grid", gridTemplateColumns: "1.35fr 1fr", gap: 14 }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
-            <Metric label="BEST EDGE" value={bestEdge?.edge == null ? "--" : pct(bestEdge.edge, 2)} color={edgeColor(bestEdge?.edge ?? null)} />
+            <Metric
+              label="BEST vs MKT"
+              value={bestEdge == null ? "--" : pct(bestEdge.edge_vs_market ?? bestEdge.edge, 2)}
+              color={edgeColor(bestEdge?.edge_vs_market ?? bestEdge?.edge ?? null)}
+            />
             <Metric label="BEST PRICE" value={odds(bestEdge?.best_decimal)} sub={bestEdge?.best_book || "--"} />
             <Metric label="xG MODEL" value={`${(board?.expected_home_goals ?? 0).toFixed(2)}-${(board?.expected_away_goals ?? 0).toFixed(2)}`} />
             <Metric label="BOOKS" value={String(Math.max(0, ...sortedEdges.map((e) => e.book_count)))} />
@@ -120,8 +130,10 @@ export default function EdgeBoardPanel({ match, onUseLegs }: Props) {
                 <th>SELECTION</th>
                 <th className="right">MODEL</th>
                 <th className="right">FAIR</th>
+                <th className="right">NO-VIG</th>
                 <th className="right">BEST</th>
                 <th className="right">EDGE</th>
+                <th className="right">VS MKT</th>
                 <th className="right">KELLY</th>
                 <th></th>
               </tr>
@@ -135,11 +147,15 @@ export default function EdgeBoardPanel({ match, onUseLegs }: Props) {
                     <td className="mono">{e.label}</td>
                     <td className="right mono">{pct(e.model_probability)}</td>
                     <td className="right mono dim">{odds(e.fair_decimal_odds)}</td>
+                    <td className="right mono dim">{e.no_vig_market_prob != null ? pct(e.no_vig_market_prob) : "--"}</td>
                     <td className="right mono">
                       {odds(e.best_decimal)}
                       <span className="dim"> {e.best_book ? e.best_book.slice(0, 8) : ""}</span>
                     </td>
                     <td className="right mono" style={{ color: edgeColor(e.edge) }}>{pct(e.edge, 2)}</td>
+                    <td className="right mono" style={{ color: edgeColor(e.edge_vs_market) }}>
+                      {e.edge_vs_market != null ? pct(e.edge_vs_market, 2) : "--"}
+                    </td>
                     <td className="right mono dim">{pct(e.kelly_fraction, 2)}</td>
                     <td className="right">
                       <button
