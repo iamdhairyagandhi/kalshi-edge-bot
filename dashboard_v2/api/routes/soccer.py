@@ -301,7 +301,7 @@ class SoccerEngine:
         if self.is_ready():
             return True
         teams = self.store.teams_all()
-        matches = self.store.historical_matches_all()
+        matches = self.store.historical_matches()
         if not teams or not matches:
             return False
         team_lookup = {
