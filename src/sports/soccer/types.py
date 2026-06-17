@@ -65,6 +65,18 @@ class MatchSim:
     red_cards: List[Tuple[str, int]] = field(default_factory=list)
     minutes_played: Dict[str, int] = field(default_factory=dict)
     shots_on_target: Dict[str, int] = field(default_factory=dict)
+    # team-level match stats (corners / shots / SOT / fouls), sampled
+    # independently from per-team Poisson rates modulated by attack/defense.
+    home_corners: int = 0
+    away_corners: int = 0
+    home_shots: int = 0
+    away_shots: int = 0
+    home_shots_on_target: int = 0
+    away_shots_on_target: int = 0
+    home_fouls: int = 0
+    away_fouls: int = 0
+    home_yellow: int = 0
+    away_yellow: int = 0
 
     @property
     def total_goals(self) -> int:
@@ -107,6 +119,22 @@ class MatchSim:
     @property
     def total_cards(self) -> int:
         return len(self.yellow_cards) + len(self.red_cards)
+
+    @property
+    def total_corners(self) -> int:
+        return self.home_corners + self.away_corners
+
+    @property
+    def total_shots(self) -> int:
+        return self.home_shots + self.away_shots
+
+    @property
+    def total_shots_on_target_count(self) -> int:
+        return self.home_shots_on_target + self.away_shots_on_target
+
+    @property
+    def total_fouls(self) -> int:
+        return self.home_fouls + self.away_fouls
 
 
 # ----------------------------------------------------------------------

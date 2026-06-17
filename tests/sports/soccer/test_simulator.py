@@ -113,3 +113,46 @@ def test_correlated_legs_have_correlation_factor_above_one():
     q = price_bet_builder(sims, legs)
     # joint probability should exceed product of marginals
     assert q.correlation_factor > 1.0
+
+
+def test_simulator_populates_team_stat_fields():
+    """Corners/shots/SOT/fouls/yellows must be non-negative ints, and
+    the SOT >= goals invariant must hold per side."""
+    sim = _make_simulator()
+    sims = sim.simulate("H", "A", neutral_venue=True,
+                         config=SimulationConfig(n_sims=2000, seed=11))
+    for s in sims:
+        assert isinstance(s.home_corners, int) and s.home_corners >= 0
+        assert isinstance(s.away_corners, int) and s.away_corners >= 0
+        assert isinstance(s.home_shots, int) and s.home_shots >= 0
+        assert isinstance(s.away_shots, int) and s.away_shots >= 0
+        assert isinstance(s.home_fouls, int) and s.home_fouls >= 0
+        assert isinstance(s.home_yellow, int) and s.home_yellow >= 0
+        # SOT must be at least the number of goals
+        assert s.home_shots_on_target >= s.home_goals
+        assert s.away_shots_on_target >= s.away_goals
+    # mean corners across 2000 sims should be in a realistic ballpark
+    avg_corners = sum(s.total_corners for s in sims) / len(sims)
+    assert 6.0 < avg_corners < 16.0
+    avg_shots = sum(s.total_shots for s in sims) / len(sims)
+    assert 18.0 < avg_shots < 35.0
+    avg_fouls = sum(s.total_fouls for s in sims) / len(sims)
+    assert 15.0 < avg_fouls < 30.0
+
+
+def test_bet_builder_stat_market_predicates():
+    """Over/under predicates on the new stat markets evaluate as expected."""
+    sim = _make_simulator()
+    sims = sim.simulate("H", "A", neutral_venue=True,
+                         config=SimulationConfig(n_sims=3000, seed=21))
+    # Over 5.5 corners should be high probability given default rates.
+    q_corners = price_bet_builder(sims, [BetLeg("total_corners", {"line": 5.5, "side": "over"})])
+    assert q_corners.fair_probability > 0.85
+    # Over 100 corners should be near zero.
+    q_impossible = price_bet_builder(sims, [BetLeg("total_corners", {"line": 100.0, "side": "over"})])
+    assert q_impossible.fair_probability < 0.01
+    # Team shots and team SOT also wired
+    q_team = price_bet_builder(sims, [BetLeg("team_shots", {"team": "home", "line": 5.5, "side": "over"})])
+    assert 0.0 < q_team.fair_probability < 1.0
+    q_fouls = price_bet_builder(sims, [BetLeg("total_fouls", {"line": 15.5, "side": "over"})])
+    assert q_fouls.fair_probability > 0.5

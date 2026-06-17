@@ -932,7 +932,7 @@ def betslips(
     for slip in ranked:
         if len(final) >= max_slips:
             break
-        if slip.slip_type != "cross_fixture_parlay" and per_fixture.get(slip.fixture_id, 0) >= 3:
+        if slip.slip_type != "cross_fixture_parlay" and per_fixture.get(slip.fixture_id, 0) >= 5:
             continue
         if slip.stake_usd > 0 and total_stake + slip.stake_usd > max_total_stake:
             remaining = max(0.0, max_total_stake - total_stake)
@@ -1177,6 +1177,15 @@ def _parlay_blueprints(
     home: str,
     away: str,
 ) -> List[SoccerParlayBlueprintOut]:
+    # Empirically tune the over/under lines per stat to whatever the sims
+    # produce a roughly-50/50 split at — avoids surfacing legs whose
+    # probabilities are stuck near 0 or 1.
+    line_corners = _pick_line([s.total_corners for s in sims], default=9.5, candidates=[7.5, 8.5, 9.5, 10.5, 11.5])
+    line_shots = _pick_line([s.total_shots for s in sims], default=24.5, candidates=[20.5, 22.5, 24.5, 26.5, 28.5])
+    line_sot = _pick_line([s.total_shots_on_target_count for s in sims], default=8.5, candidates=[6.5, 7.5, 8.5, 9.5, 10.5])
+    line_fouls = _pick_line([s.total_fouls for s in sims], default=20.5, candidates=[18.5, 20.5, 22.5, 24.5])
+    line_cards = _pick_line([s.total_cards for s in sims], default=4.5, candidates=[2.5, 3.5, 4.5, 5.5])
+
     candidates: List[tuple[str, BetLeg]] = [
         (f"{home} win", BetLeg(kind="match_result", params={"side": "H"}, label=f"{home} win")),
         ("Draw", BetLeg(kind="match_result", params={"side": "D"}, label="Draw")),
@@ -1185,6 +1194,13 @@ def _parlay_blueprints(
         ("Under 2.5 goals", BetLeg(kind="total_goals", params={"line": 2.5, "side": "under"}, label="Under 2.5 goals")),
         ("BTTS yes", BetLeg(kind="btts", params={"side": "yes"}, label="BTTS yes")),
         ("BTTS no", BetLeg(kind="btts", params={"side": "no"}, label="BTTS no")),
+        (f"Over {line_corners} corners", BetLeg(kind="total_corners", params={"line": line_corners, "side": "over"}, label=f"Over {line_corners} corners")),
+        (f"Under {line_corners} corners", BetLeg(kind="total_corners", params={"line": line_corners, "side": "under"}, label=f"Under {line_corners} corners")),
+        (f"Over {line_shots} shots", BetLeg(kind="total_shots", params={"line": line_shots, "side": "over"}, label=f"Over {line_shots} shots")),
+        (f"Over {line_sot} shots on target", BetLeg(kind="total_shots_on_target", params={"line": line_sot, "side": "over"}, label=f"Over {line_sot} SOT")),
+        (f"Over {line_fouls} fouls", BetLeg(kind="total_fouls", params={"line": line_fouls, "side": "over"}, label=f"Over {line_fouls} fouls")),
+        (f"Over {line_cards} cards", BetLeg(kind="total_cards", params={"line": line_cards, "side": "over"}, label=f"Over {line_cards} cards")),
+        (f"Under {line_cards} cards", BetLeg(kind="total_cards", params={"line": line_cards, "side": "under"}, label=f"Under {line_cards} cards")),
     ]
     single_prob = {
         "match_result:H": probs.get("home_win", 0.0),
@@ -1195,18 +1211,25 @@ def _parlay_blueprints(
         "btts:yes": probs.get("btts_yes", 0.0),
         "btts:no": probs.get("btts_no", 0.0),
     }
-
-    def key(leg: BetLeg) -> str:
-        if leg.kind == "match_result":
-            return f"match_result:{str(leg.params.get('side', '')).upper()}"
-        return f"{leg.kind}:{str(leg.params.get('side', '')).lower()}"
+    # For stat legs we estimate the single-leg prob from sims directly.
+    for label_a, leg_a in candidates:
+        k = key_func(leg_a)
+        if k in single_prob:
+            continue
+        single_prob[k] = _leg_prob(sims, leg_a)
 
     priced: List[tuple[float, SoccerParlayBlueprintOut]] = []
     for i, (label_a, leg_a) in enumerate(candidates):
         for label_b, leg_b in candidates[i + 1:]:
             if leg_a.kind == leg_b.kind:
                 continue
-            if single_prob.get(key(leg_a), 0.0) < 0.30 or single_prob.get(key(leg_b), 0.0) < 0.30:
+            # Skip parlays mixing two "wide" stat legs of similar kind to
+            # avoid generating noisy combinations.
+            if {leg_a.kind, leg_b.kind} <= {"total_shots", "total_shots_on_target", "total_corners"}:
+                continue
+            pa = single_prob.get(key_func(leg_a), 0.0)
+            pb = single_prob.get(key_func(leg_b), 0.0)
+            if pa < 0.30 or pb < 0.30:
                 continue
             quote = price_bet_builder(sims, [leg_a, leg_b], min_edge=settings.soccer_min_edge)
             if quote.fair_probability < 0.12 or quote.risk_level in {"high", "lottery"}:
@@ -1228,6 +1251,52 @@ def _parlay_blueprints(
                 ),
             ))
     return [p for _score, p in sorted(priced, key=lambda x: -x[0])[:8]]
+
+
+def key_func(leg: BetLeg) -> str:
+    if leg.kind == "match_result":
+        return f"match_result:{str(leg.params.get('side', '')).upper()}"
+    if leg.kind in {"total_corners", "total_shots", "total_shots_on_target",
+                    "total_fouls", "total_cards", "total_goals"}:
+        return f"{leg.kind}:{str(leg.params.get('side', '')).lower()}:{leg.params.get('line','')}"
+    if leg.kind in {"team_corners", "team_shots", "team_shots_on_target",
+                    "team_fouls", "team_cards", "team_total"}:
+        return (f"{leg.kind}:{leg.params.get('team','')}:"
+                f"{str(leg.params.get('side','')).lower()}:{leg.params.get('line','')}")
+    return f"{leg.kind}:{str(leg.params.get('side', '')).lower()}"
+
+
+def _leg_prob(sims: List[object], leg: BetLeg) -> float:
+    if not sims:
+        return 0.0
+    hits = 0
+    for s in sims:
+        from src.sports.soccer.simulator.bet_builder import _evaluate
+        try:
+            if _evaluate(s, leg):
+                hits += 1
+        except Exception:
+            return 0.0
+    return hits / len(sims)
+
+
+def _pick_line(values: List[int], *, default: float, candidates: List[float]) -> float:
+    """Pick the candidate line whose over-probability is closest to 0.55
+    (slight bias toward favouring the under so we don't always recommend
+    overs). Falls back to `default` if no values."""
+    if not values:
+        return default
+    n = len(values)
+    best_line = default
+    best_score = float("inf")
+    for line in candidates:
+        over_p = sum(1 for v in values if v > line) / n
+        # target 0.50-0.55 so the leg isn't a near-cert one way or the other
+        score = abs(over_p - 0.53)
+        if score < best_score:
+            best_score = score
+            best_line = line
+    return best_line
 
 
 def _betslips_for_fixture(
@@ -1319,6 +1388,21 @@ def _betslips_for_fixture(
         neutral_venue=neutral,
         config=SimulationConfig(n_sims=max(500, min(int(n_sims), 8000)), seed=hash((fixture["id"], "betslips")) & 0xFFFFFFFF),
     )
+
+    # Stat-market singles (corners/shots/SOT/fouls/cards). The Odds API
+    # free tier does not return these markets, so we publish them as
+    # model-only suggestions with a minimum acceptable book price.
+    stat_singles = _stat_market_singles(
+        fixture=fixture,
+        match_label=match_label,
+        home=home,
+        away=away,
+        sims=sims,
+        bankroll=bankroll,
+        min_edge=min_edge,
+    )
+    slips.extend(stat_singles)
+
     blueprints = _parlay_blueprints(probs=probs, sims=sims, home=home, away=away)
     for bp in blueprints[:3]:
         if bp.risk_level not in {"safer", "moderate"} or bp.fair_probability < 0.14:
@@ -1361,6 +1445,186 @@ def _betslips_for_fixture(
             ],
         ))
     return slips
+
+
+def _stat_market_singles(
+    *,
+    fixture: Dict[str, object],
+    match_label: str,
+    home: str,
+    away: str,
+    sims: List[object],
+    bankroll: float,
+    min_edge: float,
+) -> List[SoccerBetslipOut]:
+    """Emit model-only singles for stat markets (corners, shots, SOT,
+    fouls, cards) that the free Odds API tier does not cover. Each
+    line is auto-tuned to land near a ~52% probability so the bet is
+    realistic rather than a near-certainty."""
+    if not sims:
+        return []
+
+    def _stat_values(key: str) -> List[int]:
+        return [int(getattr(s, key)) for s in sims]
+
+    markets = [
+        ("total_corners", "total_corners", "Total corners", [7.5, 8.5, 9.5, 10.5, 11.5, 12.5], 9.5),
+        ("total_shots", "total_shots", "Total shots", [18.5, 20.5, 22.5, 24.5, 26.5, 28.5], 24.5),
+        ("total_shots_on_target", "total_shots_on_target_count", "Total shots on target", [5.5, 6.5, 7.5, 8.5, 9.5, 10.5], 8.5),
+        ("total_fouls", "total_fouls", "Total fouls", [16.5, 18.5, 20.5, 22.5, 24.5], 20.5),
+        ("total_cards", "total_cards", "Total cards", [2.5, 3.5, 4.5, 5.5, 6.5], 4.5),
+    ]
+    team_markets = [
+        ("team_corners", "home_corners", "away_corners", "corners", [2.5, 3.5, 4.5, 5.5, 6.5], 4.5),
+        ("team_shots", "home_shots", "away_shots", "shots", [8.5, 10.5, 12.5, 14.5], 12.5),
+        ("team_shots_on_target", "home_shots_on_target", "away_shots_on_target", "shots on target", [2.5, 3.5, 4.5, 5.5], 4.5),
+        ("team_fouls", "home_fouls", "away_fouls", "fouls", [7.5, 9.5, 11.5, 13.5], 10.5),
+        ("team_cards", "home_yellow", "away_yellow", "cards", [0.5, 1.5, 2.5, 3.5], 1.5),
+    ]
+
+    out: List[SoccerBetslipOut] = []
+
+    def _publish_total(kind: str, attr: str, label_prefix: str, candidates: List[float], default: float) -> None:
+        values = _stat_values(attr)
+        if not values:
+            return
+        for side in ("over", "under"):
+            line = _line_near_target(values, candidates, default, side=side, target=0.55)
+            p = _empirical_side_prob(values, line, side)
+            if p < 0.50 or p > 0.78:
+                continue
+            slip = _build_stat_single(
+                fixture=fixture,
+                match_label=match_label,
+                kind=kind,
+                params={"line": line, "side": side},
+                label=f"{side.capitalize()} {line} {label_prefix.lower()}",
+                p_model=p,
+                bankroll=bankroll,
+                min_edge=min_edge,
+            )
+            if slip is not None:
+                out.append(slip)
+
+    def _publish_team(kind: str, home_attr: str, away_attr: str, suffix: str, candidates: List[float], default: float) -> None:
+        for team_id, team_name, attr in (("home", home, home_attr), ("away", away, away_attr)):
+            values = [int(getattr(s, attr)) for s in sims]
+            if not values:
+                continue
+            for side in ("over", "under"):
+                line = _line_near_target(values, candidates, default, side=side, target=0.55)
+                p = _empirical_side_prob(values, line, side)
+                if p < 0.52 or p > 0.78:
+                    continue
+                slip = _build_stat_single(
+                    fixture=fixture,
+                    match_label=match_label,
+                    kind=kind,
+                    params={"team": team_id, "line": line, "side": side},
+                    label=f"{team_name} {side} {line} {suffix}",
+                    p_model=p,
+                    bankroll=bankroll,
+                    min_edge=min_edge,
+                )
+                if slip is not None:
+                    out.append(slip)
+
+    for kind, attr, label, candidates, default in markets:
+        _publish_total(kind, attr, label, candidates, default)
+    for kind, h_attr, a_attr, suffix, candidates, default in team_markets:
+        _publish_team(kind, h_attr, a_attr, suffix, candidates, default)
+    # Keep at most 8 stat singles per fixture to avoid drowning the UI.
+    return out[:8]
+
+
+def _line_near_target(values: List[int], candidates: List[float], default: float, *, side: str, target: float) -> float:
+    """Pick the candidate line whose chosen-side probability sits closest
+    to `target`. Prefers lines that produce a realistic edge."""
+    if not values:
+        return default
+    n = len(values)
+    best_line = default
+    best_score = float("inf")
+    for line in candidates:
+        if side == "over":
+            p = sum(1 for v in values if v > line) / n
+        else:
+            p = sum(1 for v in values if v < line) / n
+        score = abs(p - target)
+        if score < best_score:
+            best_score = score
+            best_line = line
+    return best_line
+
+
+def _empirical_side_prob(values: List[int], line: float, side: str) -> float:
+    if not values:
+        return 0.0
+    n = len(values)
+    if side == "over":
+        return sum(1 for v in values if v > line) / n
+    return sum(1 for v in values if v < line) / n
+
+
+def _build_stat_single(
+    *,
+    fixture: Dict[str, object],
+    match_label: str,
+    kind: str,
+    params: Dict[str, object],
+    label: str,
+    p_model: float,
+    bankroll: float,
+    min_edge: float,
+) -> Optional[SoccerBetslipOut]:
+    if p_model <= 0 or p_model >= 1:
+        return None
+    fair = 1.0 / p_model
+    min_price = fair * (1.0 + max(min_edge, 0.05))
+    # Stat markets generally settle close to the line, so we cap stake to
+    # well under 1% bankroll until we have closing-line proof of edge.
+    stake_fraction = min(settings.soccer_kelly_cap * 0.35, 0.004)
+    if p_model < 0.55:
+        stake_fraction *= 0.75
+    stake = round(bankroll * stake_fraction, 2)
+    safety = max(0.0, min(100.0, 50 + (p_model - 0.5) * 100))
+    risk_level = "moderate" if p_model >= 0.55 else "high"
+    risk_flags: List[str] = ["Model-only price; The Odds API free tier does not return this market."]
+    if p_model < 0.55:
+        risk_flags.append("thin empirical probability")
+    slug = f"{kind}:{params.get('team','total')}:{params.get('side','')}:{params.get('line','')}"
+    return SoccerBetslipOut(
+        slip_id=f"{fixture['id']}:{slug}",
+        fixture_id=str(fixture["id"]),
+        match_label=match_label,
+        kickoff_unix=int(fixture["kickoff_unix"]),
+        slip_type="model_single",
+        title=label,
+        legs=[SoccerBetslipLegOut(
+            kind=kind,
+            label=label,
+            params=dict(params),
+            model_probability=float(p_model),
+            fair_decimal_odds=round(fair, 3),
+        )],
+        fair_probability=float(p_model),
+        fair_decimal_odds=round(fair, 3),
+        book_decimal_odds=None,
+        minimum_acceptable_decimal=round(min_price, 3),
+        edge=None,
+        kelly_fraction=stake_fraction,
+        stake_usd=stake,
+        safety_score=safety,
+        risk_level=risk_level,
+        risk_flags=risk_flags,
+        confidence=max(0.30, min(0.70, p_model - 0.05)),
+        reasons=[
+            f"Joint Monte Carlo gives {p_model * 100:.1f}% — fair price {fair:.2f}.",
+            f"Only bet if the sportsbook quotes at least {min_price:.2f}.",
+            "Line auto-tuned from simulator distribution to avoid near-certain or noisy edges.",
+        ],
+        warnings=risk_flags,
+    )
 
 
 def _single_confidence(*, p_model: float, edge: float, book_count: int) -> tuple[float, List[str]]:
@@ -1502,11 +1766,13 @@ def _ranked_mixed_slips(slips: List[SoccerBetslipOut], *, max_slips: int) -> Lis
     singles = sorted([s for s in slips if s.slip_type == "single"], key=_betslip_rank, reverse=True)
     same_game = sorted([s for s in slips if s.slip_type == "model_parlay"], key=_betslip_rank, reverse=True)
     cross = sorted([s for s in slips if s.slip_type == "cross_fixture_parlay"], key=_betslip_rank, reverse=True)
+    stat_singles = sorted([s for s in slips if s.slip_type == "model_single"], key=_betslip_rank, reverse=True)
     out: List[SoccerBetslipOut] = []
     quotas = [
         (cross, max(2, max_slips // 4)),
         (same_game, max(2, max_slips // 4)),
-        (singles, max(2, max_slips // 3)),
+        (singles, max(2, max_slips // 4)),
+        (stat_singles, max(2, max_slips // 4)),
     ]
     for bucket, quota in quotas:
         for slip in bucket[:quota]:

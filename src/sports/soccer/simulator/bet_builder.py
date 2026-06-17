@@ -86,6 +86,88 @@ def _total_cards(sim: MatchSim, params: dict) -> bool:
     return sim.total_cards < line
 
 
+def _team_cards(sim: MatchSim, params: dict) -> bool:
+    line = float(params.get("line", 1.5))
+    side = str(params.get("side", "over")).lower()
+    team = str(params.get("team", "home")).lower()
+    n = sim.home_yellow if team == "home" else sim.away_yellow
+    if side == "over":
+        return n > line
+    return n < line
+
+
+def _total_corners(sim: MatchSim, params: dict) -> bool:
+    line = float(params.get("line", 9.5))
+    side = str(params.get("side", "over")).lower()
+    if side == "over":
+        return sim.total_corners > line
+    return sim.total_corners < line
+
+
+def _team_corners(sim: MatchSim, params: dict) -> bool:
+    line = float(params.get("line", 4.5))
+    side = str(params.get("side", "over")).lower()
+    team = str(params.get("team", "home")).lower()
+    n = sim.home_corners if team == "home" else sim.away_corners
+    if side == "over":
+        return n > line
+    return n < line
+
+
+def _total_shots(sim: MatchSim, params: dict) -> bool:
+    line = float(params.get("line", 24.5))
+    side = str(params.get("side", "over")).lower()
+    if side == "over":
+        return sim.total_shots > line
+    return sim.total_shots < line
+
+
+def _team_shots(sim: MatchSim, params: dict) -> bool:
+    line = float(params.get("line", 12.5))
+    side = str(params.get("side", "over")).lower()
+    team = str(params.get("team", "home")).lower()
+    n = sim.home_shots if team == "home" else sim.away_shots
+    if side == "over":
+        return n > line
+    return n < line
+
+
+def _total_shots_on_target(sim: MatchSim, params: dict) -> bool:
+    line = float(params.get("line", 8.5))
+    side = str(params.get("side", "over")).lower()
+    if side == "over":
+        return sim.total_shots_on_target_count > line
+    return sim.total_shots_on_target_count < line
+
+
+def _team_shots_on_target(sim: MatchSim, params: dict) -> bool:
+    line = float(params.get("line", 4.5))
+    side = str(params.get("side", "over")).lower()
+    team = str(params.get("team", "home")).lower()
+    n = sim.home_shots_on_target if team == "home" else sim.away_shots_on_target
+    if side == "over":
+        return n > line
+    return n < line
+
+
+def _total_fouls(sim: MatchSim, params: dict) -> bool:
+    line = float(params.get("line", 20.5))
+    side = str(params.get("side", "over")).lower()
+    if side == "over":
+        return sim.total_fouls > line
+    return sim.total_fouls < line
+
+
+def _team_fouls(sim: MatchSim, params: dict) -> bool:
+    line = float(params.get("line", 10.5))
+    side = str(params.get("side", "over")).lower()
+    team = str(params.get("team", "home")).lower()
+    n = sim.home_fouls if team == "home" else sim.away_fouls
+    if side == "over":
+        return n > line
+    return n < line
+
+
 LEG_PREDICATES: Dict[str, LegPredicate] = {
     "match_result": _match_result,
     "total_goals": _total_goals,
@@ -98,6 +180,15 @@ LEG_PREDICATES: Dict[str, LegPredicate] = {
     "player_yellow": _player_yellow,
     "player_red": _player_red,
     "total_cards": _total_cards,
+    "team_cards": _team_cards,
+    "total_corners": _total_corners,
+    "team_corners": _team_corners,
+    "total_shots": _total_shots,
+    "team_shots": _team_shots,
+    "total_shots_on_target": _total_shots_on_target,
+    "team_shots_on_target": _team_shots_on_target,
+    "total_fouls": _total_fouls,
+    "team_fouls": _team_fouls,
 }
 
 
@@ -112,6 +203,11 @@ MEDIUM_VARIANCE_LEGS = {
     "anytime_scorer",
     "player_yellow",
     "total_cards",
+    "team_cards",
+    "team_corners",
+    "team_shots",
+    "team_shots_on_target",
+    "team_fouls",
 }
 
 

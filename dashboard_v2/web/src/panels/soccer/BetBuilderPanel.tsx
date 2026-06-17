@@ -30,17 +30,26 @@ type LegDraft = {
 };
 
 const LEG_KINDS = [
-  { kind: "match_result",    desc: "1X2 result" },
-  { kind: "total_goals",     desc: "Total goals over/under" },
-  { kind: "btts",            desc: "Both teams to score" },
-  { kind: "team_total",      desc: "Team total over/under" },
-  { kind: "correct_score",   desc: "Correct score" },
-  { kind: "anytime_scorer",  desc: "Anytime scorer" },
-  { kind: "first_scorer",    desc: "First scorer" },
-  { kind: "last_scorer",     desc: "Last scorer" },
-  { kind: "player_yellow",   desc: "Player yellow card" },
-  { kind: "player_red",      desc: "Player red card" },
-  { kind: "total_cards",     desc: "Total cards over/under" },
+  { kind: "match_result",          desc: "1X2 result" },
+  { kind: "total_goals",           desc: "Total goals over/under" },
+  { kind: "btts",                  desc: "Both teams to score" },
+  { kind: "team_total",            desc: "Team total goals over/under" },
+  { kind: "correct_score",         desc: "Correct score" },
+  { kind: "anytime_scorer",        desc: "Anytime scorer" },
+  { kind: "first_scorer",          desc: "First scorer" },
+  { kind: "last_scorer",           desc: "Last scorer" },
+  { kind: "player_yellow",         desc: "Player yellow card" },
+  { kind: "player_red",            desc: "Player red card" },
+  { kind: "total_cards",           desc: "Total cards over/under" },
+  { kind: "team_cards",            desc: "Team cards over/under" },
+  { kind: "total_corners",         desc: "Total corners over/under" },
+  { kind: "team_corners",          desc: "Team corners over/under" },
+  { kind: "total_shots",           desc: "Total shots over/under" },
+  { kind: "team_shots",            desc: "Team shots over/under" },
+  { kind: "total_shots_on_target", desc: "Total SOT over/under" },
+  { kind: "team_shots_on_target",  desc: "Team SOT over/under" },
+  { kind: "total_fouls",           desc: "Total fouls over/under" },
+  { kind: "team_fouls",            desc: "Team fouls over/under" },
 ] as const;
 
 function defaultLeg(match: SoccerMatchSummary | null, kind: string): LegDraft {
@@ -61,6 +70,15 @@ function defaultLeg(match: SoccerMatchSummary | null, kind: string): LegDraft {
     case "player_yellow":  return { id, kind, params: { player_id: player }, label: `${playerName} yellow` };
     case "player_red":     return { id, kind, params: { player_id: player }, label: `${playerName} red` };
     case "total_cards":    return { id, kind, params: { line: 4.5, side: "over" }, label: "Over 4.5 cards" };
+    case "team_cards":     return { id, kind, params: { team: "home", line: 1.5, side: "over" }, label: `${homeName} over 1.5 cards` };
+    case "total_corners":  return { id, kind, params: { line: 9.5, side: "over" }, label: "Over 9.5 corners" };
+    case "team_corners":   return { id, kind, params: { team: "home", line: 4.5, side: "over" }, label: `${homeName} over 4.5 corners` };
+    case "total_shots":    return { id, kind, params: { line: 24.5, side: "over" }, label: "Over 24.5 shots" };
+    case "team_shots":     return { id, kind, params: { team: "home", line: 12.5, side: "over" }, label: `${homeName} over 12.5 shots` };
+    case "total_shots_on_target": return { id, kind, params: { line: 8.5, side: "over" }, label: "Over 8.5 SOT" };
+    case "team_shots_on_target":  return { id, kind, params: { team: "home", line: 4.5, side: "over" }, label: `${homeName} over 4.5 SOT` };
+    case "total_fouls":    return { id, kind, params: { line: 20.5, side: "over" }, label: "Over 20.5 fouls" };
+    case "team_fouls":     return { id, kind, params: { team: "home", line: 10.5, side: "over" }, label: `${homeName} over 10.5 fouls` };
     default:               return { id, kind, params: {}, label: kind };
   }
 }
@@ -94,6 +112,10 @@ function legParamEditor(
       );
     case "total_goals":
     case "total_cards":
+    case "total_corners":
+    case "total_shots":
+    case "total_shots_on_target":
+    case "total_fouls":
       return (
         <span style={{ display: "flex", gap: 6 }}>
           <input type="number" step={0.5} style={{ ...baseStyle, width: 60 }}
@@ -115,6 +137,11 @@ function legParamEditor(
         </select>
       );
     case "team_total":
+    case "team_cards":
+    case "team_corners":
+    case "team_shots":
+    case "team_shots_on_target":
+    case "team_fouls":
       return (
         <span style={{ display: "flex", gap: 6 }}>
           <select style={baseStyle} value={String(leg.params.team ?? "home")}
