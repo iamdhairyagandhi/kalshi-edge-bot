@@ -51,6 +51,14 @@ function horizonLabel(h: Horizon): string {
   return "ALL UPCOMING";
 }
 
+function InfoTooltip({ label, desc }: { label: string; desc: string }) {
+  return (
+    <div title={desc} style={{ cursor: "help", borderBottom: "1px dotted var(--fg-2)" }}>
+      {label} ⓘ
+    </div>
+  );
+}
+
 export default function BetslipCreatorPanel({ onUseLegs, onSelectFixture }: Props) {
   const [batch, setBatch] = useState<SoccerBetslipBatch | null>(null);
   const [loading, setLoading] = useState(false);
@@ -88,22 +96,31 @@ export default function BetslipCreatorPanel({ onUseLegs, onSelectFixture }: Prop
     }
   }
 
+  const bankrollNum = parseFloat(bankroll) || 0;
+
   return (
     <div className="panel">
       <div className="panel-header">
         <span><span className="ind" /> &nbsp; BETSLIP CREATOR</span>
         <span className="mono dim">
           {batch
-            ? `${batch.slips.length} slips · ${money(batch.total_suggested_stake_usd)} · ${horizonLabel(horizon)}`
-            : `scanner · ${horizonLabel(horizon)}`}
+            ? `${batch.slips.length} SLIPS · ${money(batch.total_suggested_stake_usd)} TOTAL STAKE · ${horizonLabel(horizon)}`
+            : `READY · ${horizonLabel(horizon)}`}
         </span>
       </div>
       <div className="panel-body" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {/* Input Controls */}
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          <label className="mono dim" style={{ fontSize: 11 }}>bankroll</label>
-          <Input value={bankroll} onChange={setBankroll} width={90} />
-          <label className="mono dim" style={{ fontSize: 11 }}>min edge</label>
-          <Input value={minEdge} onChange={setMinEdge} width={70} />
+          <div title="Total money you're willing to use for all bets combined">
+            <label className="mono dim" style={{ fontSize: 11 }}>bankroll</label>
+            <Input value={bankroll} onChange={setBankroll} width={90} />
+            <div className="mono dim" style={{ fontSize: 9, marginTop: 2 }}>{bankrollNum > 0 ? `${bankrollNum > 100 ? "can create ~" : ""}${Math.min(14, Math.floor(bankrollNum / 20))}-14 bets` : ""}</div>
+          </div>
+          <div title="Only show bets with at least this much edge. 0.08 = 8% advantage">
+            <label className="mono dim" style={{ fontSize: 11 }}>min edge</label>
+            <Input value={minEdge} onChange={setMinEdge} width={70} />
+            <div className="mono dim" style={{ fontSize: 9, marginTop: 2 }}>({pct(parseFloat(minEdge) || 0)})</div>
+          </div>
           <div style={{ display: "flex", gap: 4 }}>
             {(["today", "week", "all"] as Horizon[]).map((h) => (
               <button
@@ -132,11 +149,12 @@ export default function BetslipCreatorPanel({ onUseLegs, onSelectFixture }: Prop
         ))}
 
         {!batch ? (
-          <div className="empty" style={{ minHeight: 120 }}>
-            creates ranked slips from live odds, model edge, Kelly sizing, parlay correlation, and risk filters
+          <div className="empty" style={{ minHeight: 120, lineHeight: 1.5 }}>
+            <div>⚙ Set bankroll and min edge, then click CREATE BETSLIPS</div>
+            <div style={{ fontSize: 10, marginTop: 6, color: "var(--fg-2)" }}>System will find the best parlay combinations using live odds, model probabilities, Kelly sizing, correlation analysis, and safety filters.</div>
           </div>
         ) : batch.slips.length === 0 ? (
-          <div className="empty" style={{ minHeight: 120 }}>no slips passed filters</div>
+          <div className="empty" style={{ minHeight: 120 }}>⚠ No slips met your filters. Try lower min edge or check if matches are available.</div>
         ) : (
           <div style={{ display: "grid", gap: 8 }}>
             {batch.slips.map((slip) => (
@@ -159,62 +177,108 @@ export default function BetslipCreatorPanel({ onUseLegs, onSelectFixture }: Prop
 }
 
 function SlipCard({ slip, onOpen, onLoad }: { slip: SoccerBetslip; onOpen: () => void; onLoad: () => void }) {
+  const odds = slip.book_decimal_odds ?? slip.minimum_acceptable_decimal;
+  const willWin = odds ? slip.stake_usd * odds : 0;
+  const profit = willWin - slip.stake_usd;
+
   return (
-    <div style={{ border: "1px solid var(--border)", borderRadius: 4, background: "rgba(255,255,255,0.02)", padding: "9px 10px" }}>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 10, alignItems: "start" }}>
+    <div style={{ border: "1px solid var(--border)", borderRadius: 4, background: "rgba(255,255,255,0.02)", padding: "10px 11px" }}>
+      {/* Header: Title and Risk Summary */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 15, alignItems: "start", marginBottom: 10, paddingBottom: 8, borderBottom: "1px solid var(--border-dim)" }}>
         <div>
-          <div className="mono" style={{ fontSize: 12 }}>{slip.title}</div>
-          <div className="mono dim" style={{ fontSize: 10, marginTop: 2 }}>
+          <div className="mono" style={{ fontSize: 13, fontWeight: 500 }}>{slip.title}</div>
+          <div className="mono dim" style={{ fontSize: 9, marginTop: 3 }}>
             {slip.match_label} · <span style={{ color: typeColor(slip.slip_type) }}>{typeLabel(slip.slip_type)}</span>
           </div>
         </div>
-        <div className="mono" style={{ color: riskColor(slip.risk_level), fontSize: 12, textAlign: "right" }}>
-          {slip.safety_score.toFixed(0)} {slip.risk_level}
+        <div style={{ textAlign: "right" }}>
+          <div className="mono" style={{ color: riskColor(slip.risk_level), fontSize: 13 }} title="Safety score: 0-100. Higher is safer.">
+            <strong>{slip.safety_score.toFixed(0)}</strong> <span style={{ fontSize: 11 }}>{slip.risk_level.toUpperCase()}</span>
+          </div>
+          <div className="mono" style={{ color: slip.edge != null ? "var(--green)" : "var(--cyan)", fontSize: 13, marginTop: 2 }} title="Your predicted edge if book odds are correct">
+            <strong>{slip.edge != null ? pct(slip.edge, 1) : "—"}</strong> <span style={{ fontSize: 10 }}>EDGE</span>
+          </div>
         </div>
-        <div className="mono" style={{ color: slip.edge != null ? "var(--green)" : "var(--cyan)", fontSize: 12, textAlign: "right" }}>
-          {slip.edge != null ? pct(slip.edge, 2) : `min ${slip.minimum_acceptable_decimal.toFixed(2)}`}
+      </div>
+
+      {/* Wager Summary - What You're Actually Betting */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 10, padding: "8px", background: "rgba(25,195,125,0.08)", borderRadius: 3 }}>
+        <div title="Amount to stake on this parlay">
+          <div className="mono dim" style={{ fontSize: 9 }}>STAKE</div>
+          <div className="mono" style={{ fontSize: 13, color: "var(--cyan)", marginTop: 2 }}>{money(slip.stake_usd)}</div>
+        </div>
+        <div title="If this bet wins, your return">
+          <div className="mono dim" style={{ fontSize: 9 }}>IF WIN</div>
+          <div className="mono" style={{ fontSize: 13, color: "var(--green)", marginTop: 2 }}>{money(willWin)}</div>
+        </div>
+        <div title="Your profit if this bet hits">
+          <div className="mono dim" style={{ fontSize: 9 }}>PROFIT</div>
+          <div className="mono" style={{ fontSize: 13, color: profit > 0 ? "var(--green)" : "var(--fg-1)", marginTop: 2 }}>{money(profit)}</div>
         </div>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginTop: 8 }}>
-        <Mini label="MODEL" value={pct(slip.fair_probability)} />
-        <Mini label="FAIR" value={slip.fair_decimal_odds.toFixed(2)} />
-        <Mini label={slip.book_decimal_odds ? "BOOK" : "MIN BOOK"} value={(slip.book_decimal_odds ?? slip.minimum_acceptable_decimal).toFixed(2)} />
-        <Mini label="STAKE" value={money(slip.stake_usd)} />
-        <Mini label="CONF" value={pct(slip.confidence)} />
+      {/* Odds Comparison */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 10 }}>
+        <div title="Your model's fair probability for this outcome">
+          <div className="mono dim" style={{ fontSize: 9 }}>MODEL PROB</div>
+          <div className="mono" style={{ fontSize: 12, marginTop: 3 }}>{pct(slip.fair_probability)}</div>
+          <div className="mono dim" style={{ fontSize: 8, marginTop: 1 }}>Fair odds: {slip.fair_decimal_odds.toFixed(2)}</div>
+        </div>
+        <div title="What the sportsbook offers. Higher = better for you.">
+          <div className="mono dim" style={{ fontSize: 9 }}>BOOK ODDS</div>
+          <div className="mono" style={{ fontSize: 12, color: slip.edge != null ? "var(--green)" : "var(--amber)", marginTop: 3 }}>
+            {(slip.book_decimal_odds ?? slip.minimum_acceptable_decimal).toFixed(2)}
+          </div>
+          <div className="mono dim" style={{ fontSize: 8, marginTop: 1 }}>{slip.book_decimal_odds ? "✓ Live" : "Min acceptable"}</div>
+        </div>
+        <div title="How confident the system is in this bet">
+          <div className="mono dim" style={{ fontSize: 9 }}>CONFIDENCE</div>
+          <div className="mono" style={{ fontSize: 12, marginTop: 3 }}>{pct(slip.confidence)}</div>
+          <div className="mono dim" style={{ fontSize: 8, marginTop: 1 }}>Based on data quality</div>
+        </div>
+        <div title="Kelly Criterion: percentage of bankroll to risk">
+          <div className="mono dim" style={{ fontSize: 9 }}>KELLY %</div>
+          <div className="mono" style={{ fontSize: 12, marginTop: 3 }}>{pct(slip.kelly_fraction, 1)}</div>
+          <div className="mono dim" style={{ fontSize: 8, marginTop: 1 }}>Bankroll sizing</div>
+        </div>
       </div>
 
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginTop: 8 }}>
-        {slip.legs.map((leg) => (
-          <span key={`${leg.kind}-${leg.label}`} className="mono" style={{
-            fontSize: 10, color: "var(--fg-1)", border: "1px solid var(--border)",
-            padding: "2px 6px", borderRadius: 2, background: "var(--bg-3)",
-          }}>{leg.label}</span>
-        ))}
+      {/* Legs - What Outcomes You're Combining */}
+      <div style={{ marginBottom: 8 }}>
+        <div className="mono dim" style={{ fontSize: 9, marginBottom: 4 }}>LEGS (outcomes you're combining):</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+          {slip.legs.map((leg) => (
+            <span key={`${leg.kind}-${leg.label}`} className="mono" style={{
+              fontSize: 9, color: "var(--fg-1)", border: "1px solid var(--border)",
+              padding: "3px 7px", borderRadius: 2, background: "var(--bg-3)",
+            }}>{leg.label}</span>
+          ))}
+        </div>
       </div>
 
-      <div style={{ display: "grid", gap: 3, marginTop: 8 }}>
-        {slip.reasons.slice(0, 3).map((r) => (
-          <div key={r} className="mono dim" style={{ fontSize: 10 }}>{r}</div>
-        ))}
-        {slip.warnings.slice(0, 3).map((w) => (
-          <div key={w} className="mono" style={{ fontSize: 10, color: "var(--amber)" }}>{w}</div>
-        ))}
-      </div>
+      {/* Why & Warnings */}
+      {slip.reasons.length > 0 && (
+        <div style={{ marginBottom: 8 }}>
+          <div className="mono dim" style={{ fontSize: 9, marginBottom: 3 }}>✓ Why this bet:</div>
+          {slip.reasons.slice(0, 2).map((r) => (
+            <div key={r} className="mono dim" style={{ fontSize: 9, marginBottom: 2 }}>{r}</div>
+          ))}
+        </div>
+      )}
+      {slip.warnings.length > 0 && (
+        <div style={{ marginBottom: 8 }}>
+          <div className="mono" style={{ fontSize: 9, marginBottom: 3, color: "var(--amber)" }}>⚠ Considerations:</div>
+          {slip.warnings.slice(0, 2).map((w) => (
+            <div key={w} className="mono" style={{ fontSize: 9, color: "var(--amber-dim)", marginBottom: 2 }}>{w}</div>
+          ))}
+        </div>
+      )}
 
-      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 8 }}>
+      {/* Actions */}
+      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 10, paddingTop: 8, borderTop: "1px solid var(--border-dim)" }}>
         <button onClick={onOpen} style={buttonStyle("ghost")}>OPEN MATCH</button>
         <button onClick={onLoad} style={buttonStyle("primary")}>LOAD BUILDER</button>
       </div>
-    </div>
-  );
-}
-
-function Mini({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <div className="mono dim" style={{ fontSize: 9, letterSpacing: "0.12em" }}>{label}</div>
-      <div className="mono" style={{ fontSize: 12 }}>{value}</div>
     </div>
   );
 }
