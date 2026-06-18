@@ -42,6 +42,7 @@ class OddsApiClient:
     api_key: Optional[str] = None
     region: str = "eu"   # eu/us/uk/au; eu has Pinnacle.
     timeout_s: float = 12.0
+    verify_ssl: bool = True
     base_url: str = _BASE
     user_agent: str = "kalshi-edge-bot/0.2"
 
@@ -56,6 +57,7 @@ class OddsApiClient:
         if self._client is None:
             self._client = httpx.Client(
                 timeout=self.timeout_s,
+                verify=self.verify_ssl,
                 headers={"User-Agent": self.user_agent},
             )
         return self._client
@@ -92,6 +94,10 @@ class OddsApiClient:
         if bookmakers:
             params["bookmakers"] = bookmakers
         return self._get(f"/sports/{sport_key}/odds", params=params)
+
+    def events(self, sport_key: str) -> List[dict]:
+        """Fetch upcoming events/fixtures for a sport."""
+        return self._get(f"/sports/{sport_key}/events")
 
     def event_odds(
         self,
@@ -131,7 +137,13 @@ class OddsApiClient:
         if r.status_code == 429:
             raise OddsApiError("429 rate-limited or monthly quota exhausted")
         if r.status_code >= 400:
-            raise OddsApiError(f"{r.status_code}: {r.text[:200]}")
+            body = r.text[:300]
+            if "<html" in body.lower() or "<!doctype html" in body.lower():
+                raise OddsApiError(
+                    f"{r.status_code}: HTML response instead of JSON "
+                    "(likely captive portal, proxy login, blocked request, or provider outage)"
+                )
+            raise OddsApiError(f"{r.status_code}: {body}")
         try:
             data = r.json()
         except ValueError as e:

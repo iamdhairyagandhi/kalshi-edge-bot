@@ -29,6 +29,8 @@ from fastapi import APIRouter, Body, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from src.config import settings
+from src.clients.soccer_ai_guru import SoccerAIGuru
+from src.sports.soccer.ai.context_builder import build_match_context
 from src.sports.soccer.calibration.isotonic import (
     CalibrationLayer,
     PredictionRecord,
@@ -245,6 +247,17 @@ class SoccerBetslipLegOut(BaseModel):
     edge: Optional[float] = None
 
 
+class SoccerGuruAnalysis(BaseModel):
+    """Full AI Guru analysis exposed on each betslip."""
+    model: str
+    rationale: str
+    key_insights: List[str] = Field(default_factory=list)
+    home_adjustment: float = 0.0
+    draw_adjustment: float = 0.0
+    away_adjustment: float = 0.0
+    confidence_multiplier: float = 1.0
+
+
 class SoccerBetslipOut(BaseModel):
     slip_id: str
     fixture_id: str
@@ -266,6 +279,8 @@ class SoccerBetslipOut(BaseModel):
     confidence: float = 0.0
     reasons: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
+    # Full AI Guru analysis — None when AI is disabled or unavailable
+    ai_guru: Optional[SoccerGuruAnalysis] = None
     # scout_only=True means we have a model price but NO confirmed book
     # quote (e.g., corners/cards markets the Odds API free tier omits).
     # The UI should render these without a stake button and label them
@@ -1120,6 +1135,42 @@ def match_summary(request: Request, fixture_id: str, n_sims: int = 5000) -> Matc
     )
 
 
+def _fetch_soccer_odds_events(markets: Optional[str] = None) -> Tuple[List[Dict[str, object]], List[str]]:
+    """Fetch sportsbook odds with graceful fallback.
+
+    Wide prop-market requests are more likely to timeout or be unsupported.
+    Preserve the core priced markets instead of forcing every betslip into
+    SCOUT mode when the long market list fails.
+    """
+    if not settings.odds_api_key:
+        return [], ["ODDS_API_KEY is not configured; only model-price parlays can be generated."]
+
+    requested = markets or settings.soccer_odds_markets
+    attempts: List[str] = []
+    for candidate in (requested, "h2h,totals,btts", "h2h,totals"):
+        if candidate and candidate not in attempts:
+            attempts.append(candidate)
+
+    failures: List[str] = []
+    for attempt in attempts:
+        try:
+            with OddsApiClient(
+                api_key=settings.odds_api_key,
+                region=settings.odds_api_region,
+                timeout_s=settings.soccer_odds_timeout_s,
+                verify_ssl=settings.soccer_odds_verify_ssl,
+            ) as client:
+                events = client.odds(sport_key=settings.odds_api_sport_key, markets=attempt)
+            notes = [f"Requested odds markets: {attempt}. Missing book markets fall back to SCOUT/model-only."]
+            if attempt != requested:
+                notes.insert(0, f"Full odds request timed out/failed; fell back to {attempt}.")
+            return events, notes
+        except OddsApiError as e:
+            failures.append(f"{attempt}: {e}")
+
+    return [], [f"Odds API unavailable after fallback attempts: {' | '.join(failures)}"]
+
+
 @router.get("/soccer/edge-board/{fixture_id}", response_model=SoccerEdgeBoardOut)
 def edge_board(request: Request, fixture_id: str, n_sims: int = 8000) -> SoccerEdgeBoardOut:
     eng = _engine(request)
@@ -1143,17 +1194,11 @@ def edge_board(request: Request, fixture_id: str, n_sims: int = 8000) -> SoccerE
 
     event: Optional[Dict[str, object]] = None
     notes: List[str] = []
-    if settings.odds_api_key:
-        try:
-            with OddsApiClient(api_key=settings.odds_api_key, region=settings.odds_api_region) as client:
-                events = client.odds(sport_key=settings.odds_api_sport_key, markets="h2h,totals")
-            event = _find_odds_event(events, fixture, home, away)
-            if event is None:
-                notes.append("No matching sportsbook event found for this fixture.")
-        except OddsApiError as e:
-            notes.append(f"Odds API unavailable: {e}")
-    else:
-        notes.append("ODDS_API_KEY is not configured.")
+    events, odds_notes = _fetch_soccer_odds_events()
+    notes.extend(odds_notes)
+    event = _find_odds_event(events, fixture, home, away) if events else None
+    if events and event is None:
+        notes.append("No matching sportsbook event found for this fixture.")
 
     specs = [
         ("1X2", "h2h", home, f"{home} win", probs["home_win"], None),
@@ -1259,14 +1304,8 @@ def betslips(
     notes: List[str] = []
     if horizon_label:
         notes.append(horizon_label)
-    if settings.odds_api_key:
-        try:
-            with OddsApiClient(api_key=settings.odds_api_key, region=settings.odds_api_region) as client:
-                events = client.odds(sport_key=settings.odds_api_sport_key, markets="h2h,totals")
-        except OddsApiError as e:
-            notes.append(f"Odds API unavailable: {e}")
-    else:
-        notes.append("ODDS_API_KEY is not configured; only model-price parlays can be generated.")
+    events, odds_notes = _fetch_soccer_odds_events()
+    notes.extend(odds_notes)
 
     slips: List[SoccerBetslipOut] = []
     for fixture in rows:
@@ -1976,7 +2015,7 @@ def _leg_prob(sims: List[object], leg: BetLeg) -> float:
 
 def _pick_line(values: List[int], *, default: float, candidates: List[float]) -> float:
     """Pick the candidate line whose over-probability is closest to 0.55
-    (slight bias toward favouring the under so we don't always recommend
+    (slight bias towards favouring the under so we don't always recommend
     overs). Falls back to `default` if no values."""
     if not values:
         return default
@@ -1991,6 +2030,81 @@ def _pick_line(values: List[int], *, default: float, candidates: List[float]) ->
             best_score = score
             best_line = line
     return best_line
+
+
+def _apply_ai_guru_adjustment(
+    *,
+    eng: SoccerEngine,
+    fixture: Dict[str, object],
+    probs: Dict[str, float],
+    events: List[Dict[str, object]],
+) -> Optional[Tuple[Dict[str, float], SoccerGuruAnalysis]]:
+    """Apply AI Guru analysis to adjust probabilities based on form, sentiment, h2h.
+    
+    Returns (adjusted_probs, SoccerGuruAnalysis) or None if AI is disabled or fails.
+    """
+    if not settings.soccer_ai_guru_enabled:
+        return None
+    
+    if not settings.openai_api_key:
+        _LOG.warning("Soccer AI Guru enabled but OPENAI_API_KEY not set")
+        return None
+    
+    try:
+        # Build match context
+        elo_dict = {}
+        for team_id, elo_rating in eng.elo.items():
+            elo_dict[team_id] = float(elo_rating.rating)
+        
+        context = build_match_context(
+            store=eng.store,
+            fixture=fixture,
+            team_names=eng.team_names,
+            elo_table=eng.elo,
+            score_model=eng.score_model,
+            events=events,
+        )
+        
+        # Call AI guru
+        with SoccerAIGuru(
+            api_key=settings.openai_api_key,
+            model=settings.soccer_ai_guru_model,
+        ) as guru:
+            assessment = guru.analyze_match(
+                context,
+                probs.get("home_win", 0.0),
+                probs.get("draw", 0.0),
+                probs.get("away_win", 0.0),
+            )
+        
+        # Apply adjustments
+        adjusted_probs = dict(probs)
+        adjusted_probs["home_win"] = max(0.01, min(0.99, (probs.get("home_win", 0.0) + assessment.probability_adjustment_home)))
+        adjusted_probs["draw"] = max(0.01, min(0.99, (probs.get("draw", 0.0) + assessment.probability_adjustment_draw)))
+        adjusted_probs["away_win"] = max(0.01, min(0.99, (probs.get("away_win", 0.0) + assessment.probability_adjustment_away)))
+        
+        # Renormalize to sum to 1
+        total = adjusted_probs.get("home_win", 0.0) + adjusted_probs.get("draw", 0.0) + adjusted_probs.get("away_win", 0.0)
+        if total > 0:
+            adjusted_probs["home_win"] = adjusted_probs.get("home_win", 0.0) / total
+            adjusted_probs["draw"] = adjusted_probs.get("draw", 0.0) / total
+            adjusted_probs["away_win"] = adjusted_probs.get("away_win", 0.0) / total
+        
+        # Build structured analysis object
+        guru_analysis = SoccerGuruAnalysis(
+            model=settings.soccer_ai_guru_model,
+            rationale=assessment.rationale,
+            key_insights=assessment.key_insights,
+            home_adjustment=assessment.probability_adjustment_home,
+            draw_adjustment=assessment.probability_adjustment_draw,
+            away_adjustment=assessment.probability_adjustment_away,
+            confidence_multiplier=assessment.confidence_multiplier,
+        )
+        return adjusted_probs, guru_analysis
+        
+    except Exception as e:
+        _LOG.exception("AI Guru analysis failed: %s", e)
+        return None
 
 
 def _betslips_for_fixture(
@@ -2011,6 +2125,21 @@ def _betslips_for_fixture(
     match_label = f"{home} vs {away}"
     probs = eng.score_model.outcome_probs(home_id, away_id, neutral=neutral, max_goals=10)
     probs = eng.calibrate_probs(probs)
+    
+    # Apply AI Guru analysis if enabled
+    ai_guru_adjustment = _apply_ai_guru_adjustment(
+        eng=eng,
+        fixture=fixture,
+        probs=probs,
+        events=events,
+    )
+    if ai_guru_adjustment:
+        probs, guru_analysis = ai_guru_adjustment
+        ai_insights = guru_analysis.key_insights + ([guru_analysis.rationale] if guru_analysis.rationale else [])
+    else:
+        guru_analysis = None
+        ai_insights = []
+    
     event = _find_odds_event(events, fixture, home, away)
     slips: List[SoccerBetslipOut] = []
 
@@ -2018,14 +2147,18 @@ def _betslips_for_fixture(
     # within a market shares the same no-vig consensus probability.
     h2h_market = [(home, None), ("Draw", None), (away, None)]
     totals_market = [("Over", 2.5), ("Under", 2.5)]
+    btts_market = [("Yes", None), ("No", None)]
     h2h_vec = _devig_vector(event, "h2h", h2h_market) if event else None
     totals_vec = _devig_vector(event, "totals", totals_market) if event else None
+    btts_vec = _devig_vector(event, "btts", btts_market) if event else None
     market_vectors = {
         ("h2h", home, None): h2h_vec,
         ("h2h", "Draw", None): h2h_vec,
         ("h2h", away, None): h2h_vec,
         ("totals", "Over", 2.5): totals_vec,
         ("totals", "Under", 2.5): totals_vec,
+        ("btts", "Yes", None): btts_vec,
+        ("btts", "No", None): btts_vec,
     }
 
     specs = [
@@ -2034,6 +2167,8 @@ def _betslips_for_fixture(
         ("match_result", {"side": "A"}, "h2h", away, f"{away} win", probs["away_win"], None),
         ("total_goals", {"line": 2.5, "side": "over"}, "totals", "Over", "Over 2.5 goals", probs["over_2_5"], 2.5),
         ("total_goals", {"line": 2.5, "side": "under"}, "totals", "Under", "Under 2.5 goals", probs["under_2_5"], 2.5),
+        ("btts", {"side": "yes"}, "btts", "Yes", "BTTS yes", probs["btts_yes"], None),
+        ("btts", {"side": "no"}, "btts", "No", "BTTS no", probs["btts_no"], None),
     ]
     for kind, params, market_key, selection, label, p_model, point in specs:
         prices = _book_prices(event, market_key, selection, point=point) if event else []
@@ -2069,6 +2204,8 @@ def _betslips_for_fixture(
             f"Best live price {best_decimal:.2f} at {best_book}; fair price {rep.fair_decimal_odds:.2f}.",
             f"Kelly suggests {rep.kelly_fraction * 100:.2f}% bankroll before confidence haircut.",
         ]
+        if ai_insights:
+            reasons.extend([f"AI Guru: {insight}" for insight in ai_insights])
         if rep.no_vig_market_prob is not None:
             reasons.insert(
                 1,
@@ -2105,6 +2242,7 @@ def _betslips_for_fixture(
             confidence=confidence,
             reasons=reasons,
             warnings=warnings,
+            ai_guru=guru_analysis,
         ))
 
     sims = eng.simulator().simulate(
@@ -2125,6 +2263,7 @@ def _betslips_for_fixture(
         sims=sims,
         bankroll=bankroll,
         min_edge=min_edge,
+        ai_guru=guru_analysis,
     )
     slips.extend(stat_singles)
 
@@ -2169,6 +2308,7 @@ def _betslips_for_fixture(
                 "Books apply their own SGP correlation rebate; their quoted price will be lower than the leg product.",
                 *bp.risk_flags,
             ],
+            ai_guru=guru_analysis,
             scout_only=True,
         ))
     return slips
@@ -2183,6 +2323,7 @@ def _stat_market_singles(
     sims: List[object],
     bankroll: float,
     min_edge: float,
+    ai_guru: Optional[SoccerGuruAnalysis] = None,
 ) -> List[SoccerBetslipOut]:
     """Emit model-only singles for stat markets (corners, shots, SOT,
     fouls, cards) that the free Odds API tier does not cover. Each
@@ -2229,6 +2370,7 @@ def _stat_market_singles(
                 p_model=p,
                 bankroll=bankroll,
                 min_edge=min_edge,
+                ai_guru=ai_guru,
             )
             if slip is not None:
                 out.append(slip)
@@ -2252,6 +2394,7 @@ def _stat_market_singles(
                     p_model=p,
                     bankroll=bankroll,
                     min_edge=min_edge,
+                    ai_guru=ai_guru,
                 )
                 if slip is not None:
                     out.append(slip)
@@ -2303,6 +2446,7 @@ def _build_stat_single(
     p_model: float,
     bankroll: float,
     min_edge: float,
+    ai_guru: Optional[SoccerGuruAnalysis] = None,
 ) -> Optional[SoccerBetslipOut]:
     if p_model <= 0 or p_model >= 1:
         return None
@@ -2350,6 +2494,7 @@ def _build_stat_single(
             "Auto-tuned line maximises hit-rate, not edge — confirm a real book quote before betting.",
         ],
         warnings=risk_flags,
+        ai_guru=ai_guru,
         scout_only=True,
     )
 
@@ -2472,6 +2617,29 @@ def _make_cross_fixture_parlay(
         stake_fraction *= 0.45
     stake = round(bankroll * stake_fraction * confidence, 2)
     title = " + ".join(p.title.split(" at ")[0] for p in parts)
+    gurus = [p.ai_guru for p in parts if p.ai_guru is not None]
+    aggregate_guru: Optional[SoccerGuruAnalysis] = None
+    if gurus:
+        insights: List[str] = []
+        rationales: List[str] = []
+        for p in parts:
+            if p.ai_guru is None:
+                continue
+            first_insight = p.ai_guru.key_insights[0] if p.ai_guru.key_insights else p.ai_guru.rationale
+            if first_insight:
+                insights.append(f"{p.match_label}: {first_insight}")
+            if p.ai_guru.rationale:
+                rationales.append(f"{p.match_label}: {p.ai_guru.rationale}")
+        n = len(gurus)
+        aggregate_guru = SoccerGuruAnalysis(
+            model=f"{gurus[0].model} · combined leg analysis",
+            rationale=" | ".join(rationales[:2]),
+            key_insights=insights[:4],
+            home_adjustment=sum(g.home_adjustment for g in gurus) / n,
+            draw_adjustment=sum(g.draw_adjustment for g in gurus) / n,
+            away_adjustment=sum(g.away_adjustment for g in gurus) / n,
+            confidence_multiplier=sum(g.confidence_multiplier for g in gurus) / n,
+        )
     return SoccerBetslipOut(
         slip_id="cross:" + ":".join(p.slip_id for p in parts),
         fixture_id=",".join(p.fixture_id for p in parts),
@@ -2500,6 +2668,7 @@ def _make_cross_fixture_parlay(
             "Parlay assumes fixture outcomes are independent.",
             "Stake is haircut versus singles because variance compounds.",
         ],
+        ai_guru=aggregate_guru,
     )
 
 

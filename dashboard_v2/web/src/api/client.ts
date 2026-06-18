@@ -314,6 +314,16 @@ export type SoccerBetslipLeg = {
   edge: number | null;
 };
 
+export type SoccerGuruAnalysis = {
+  model: string;
+  rationale: string;
+  key_insights: string[];
+  home_adjustment: number;
+  draw_adjustment: number;
+  away_adjustment: number;
+  confidence_multiplier: number;
+};
+
 export type SoccerBetslip = {
   slip_id: string;
   fixture_id: string;
@@ -335,6 +345,7 @@ export type SoccerBetslip = {
   confidence: number;
   reasons: string[];
   warnings: string[];
+  ai_guru: SoccerGuruAnalysis | null;
   scout_only: boolean;
 };
 

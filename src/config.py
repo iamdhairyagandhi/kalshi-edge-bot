@@ -145,12 +145,24 @@ class Settings:
     soccer_kelly_cap: float = field(default_factory=lambda: _env_float("SOCCER_KELLY_CAP", 0.02))
     soccer_decay_per_day: float = field(default_factory=lambda: _env_float("SOCCER_DECAY_PER_DAY", 0.0019))  # ~half-life 1y
     soccer_ai_review_enabled: bool = field(default_factory=lambda: _env_bool("SOCCER_AI_REVIEW_ENABLED", True))
-    soccer_ai_model: str = field(default_factory=lambda: _env("SOCCER_AI_MODEL", "gpt-5-mini"))
+    soccer_ai_model: str = field(default_factory=lambda: _env("SOCCER_AI_MODEL", "gpt-4o-mini"))
+    # Soccer AI Guru: professional bettor analysis with form, history, sentiment
+    soccer_ai_guru_enabled: bool = field(default_factory=lambda: _env_bool("SOCCER_AI_GURU_ENABLED", True))
+    soccer_ai_guru_model: str = field(default_factory=lambda: _env("SOCCER_AI_GURU_MODEL", "gpt-5-mini"))
+    soccer_ai_guru_max_matches: int = field(default_factory=lambda: _env_int("SOCCER_AI_GURU_MAX_MATCHES", 15))
 
     # The Odds API (https://the-odds-api.com)
     odds_api_key: Optional[str] = field(default_factory=lambda: _env("ODDS_API_KEY"))
     odds_api_region: str = field(default_factory=lambda: _env("ODDS_API_REGION", "eu"))
     odds_api_sport_key: str = field(default_factory=lambda: _env("ODDS_API_SPORT_KEY", "soccer_fifa_world_cup"))
+    soccer_odds_markets: str = field(
+        default_factory=lambda: _env(
+            "SOCCER_ODDS_MARKETS",
+            "h2h,totals,btts,alternate_totals,player_goal_scorer_anytime",
+        )
+    )
+    soccer_odds_timeout_s: float = field(default_factory=lambda: _env_float("SOCCER_ODDS_TIMEOUT_S", 25.0))
+    soccer_odds_verify_ssl: bool = field(default_factory=lambda: _env_bool("SOCCER_ODDS_VERIFY_SSL", True))
 
 
 settings = Settings()
