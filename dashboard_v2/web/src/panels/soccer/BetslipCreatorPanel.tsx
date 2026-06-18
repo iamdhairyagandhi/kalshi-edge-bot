@@ -1,10 +1,22 @@
 import { useState } from "react";
 import type { CSSProperties } from "react";
-import { api, SoccerBetLeg, SoccerBetslip, SoccerBetslipBatch } from "../../api/client";
+import {
+  api,
+  RecordSoccerBetPayload,
+  SoccerBetLegRecord,
+  SoccerBetLeg,
+  SoccerBetQualificationCheck,
+  SoccerBetSource,
+  SoccerBetslip,
+  SoccerBetslipBatch,
+  SoccerGuardrailReport,
+  SoccerGuardrailsBlockedError,
+} from "../../api/client";
 
 type Props = {
   onUseLegs: (legs: SoccerBetLeg[], fixtureId?: string, bookOdds?: number | null) => void;
   onSelectFixture: (fixtureId: string) => void;
+  onBetRecorded?: () => void;
 };
 
 function pct(x: number | null | undefined, digits = 1): string {
@@ -71,7 +83,7 @@ function InfoTooltip({ label, desc }: { label: string; desc: string }) {
   );
 }
 
-export default function BetslipCreatorPanel({ onUseLegs, onSelectFixture }: Props) {
+export default function BetslipCreatorPanel({ onUseLegs, onSelectFixture, onBetRecorded }: Props) {
   const [batch, setBatch] = useState<SoccerBetslipBatch | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -247,6 +259,7 @@ export default function BetslipCreatorPanel({ onUseLegs, onSelectFixture }: Prop
                   slip.fixture_id,
                   slip.book_decimal_odds,
                 )}
+                onBetRecorded={onBetRecorded}
               />
             ))}
           </div>
@@ -268,6 +281,7 @@ function SlipCard({
   onPrint,
   onOpen,
   onLoad,
+  onBetRecorded,
 }: {
   slip: SoccerBetslip;
   selected: boolean;
@@ -280,6 +294,7 @@ function SlipCard({
   onPrint: () => void;
   onOpen: () => void;
   onLoad: () => void;
+  onBetRecorded?: () => void;
 }) {
   const scout = slip.scout_only === true;
   const gate = qualifySlip(slip, manualOdds, bankroll, minEdge);
@@ -391,6 +406,13 @@ function SlipCard({
         onManualOdds={onManualOdds}
       />
       <QualificationGate result={gate} />
+
+      <RecordBetWidget
+        slip={slip}
+        gate={gate}
+        manualOdds={manualOdds}
+        onRecorded={onBetRecorded}
+      />
 
       {/* Why & Warnings */}
       {slip.reasons.length > 0 && (
@@ -942,6 +964,291 @@ function GuruBlock({ slip }: { slip: SoccerBetslip }) {
           {guru.rationale}
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function RecordBetWidget({
+  slip,
+  gate,
+  manualOdds,
+  onRecorded,
+}: {
+  slip: SoccerBetslip;
+  gate: GateResult;
+  manualOdds: string;
+  onRecorded?: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState<{ id: number; status: string } | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [notes, setNotes] = useState("");
+  const [bookmaker, setBookmaker] = useState(gate.source === "live" ? "" : "bet365");
+  const [confirmingReview, setConfirmingReview] = useState(false);
+  const [guardrailBlock, setGuardrailBlock] = useState<SoccerGuardrailReport | null>(null);
+  const [forceUnlock, setForceUnlock] = useState(false);
+  const [lineupConfirmed, setLineupConfirmed] = useState(false);
+
+  const canRecord = gate.status === "BETTABLE" || gate.status === "REVIEW";
+  if (!canRecord) {
+    return null;
+  }
+
+  const placedOdds = gate.availableOdds;
+  const stake = gate.stake;
+  const sourceForApi: SoccerBetSource = gate.source === "live" ? "live" : gate.source === "pasted" ? "pasted" : "manual";
+  const reviewNeedsNote = gate.status === "REVIEW";
+  const noteOk = !reviewNeedsNote || notes.trim().length > 0;
+  const recordEnabled = !busy && !done && placedOdds != null && placedOdds > 1 && stake > 0 && noteOk;
+  const ev = placedOdds != null
+    ? slip.fair_probability * (placedOdds - 1) * stake - (1 - slip.fair_probability) * stake
+    : null;
+
+  async function record() {
+    if (placedOdds == null) {
+      setErr("No price available — paste book odds first.");
+      return;
+    }
+    if (reviewNeedsNote && notes.trim().length === 0) {
+      setConfirmingReview(true);
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      const legs: SoccerBetLegRecord[] = slip.legs.map((l) => ({
+        kind: l.kind,
+        label: l.label ?? null,
+        params: l.params ?? {},
+      }));
+      const checks: SoccerBetQualificationCheck[] = gate.checks.map((c) => ({
+        label: c.label,
+        pass: c.pass,
+        detail: c.detail,
+        severity: c.severity ?? null,
+      }));
+      const sameGame = slip.legs.length > 1;
+      const bookDecimal = sourceForApi === "live" || sourceForApi === "pasted" ? placedOdds : null;
+      const payload: RecordSoccerBetPayload = {
+        fixture_id: slip.fixture_id,
+        legs,
+        model_probability: slip.fair_probability,
+        fair_decimal_odds: slip.fair_decimal_odds,
+        placed_decimal_odds: placedOdds,
+        stake_usd: Math.round(stake * 100) / 100,
+        qualification_status: gate.status,
+        qualification_checks: checks,
+        source: sourceForApi,
+        slip_id: slip.slip_id,
+        slip_type: slip.slip_type,
+        match_label: slip.match_label,
+        title: slip.title,
+        edge: gate.edge ?? slip.edge ?? null,
+        kelly_fraction: slip.kelly_fraction ?? null,
+        expected_value_usd: ev,
+        bookmaker: bookmaker.trim() || null,
+        notes: notes.trim() || null,
+        same_game: sameGame,
+        lineup_confirmed: lineupConfirmed,
+        book_decimal_odds: bookDecimal,
+        force: forceUnlock,
+      };
+      const resp = await api.soccerRecordBet(payload);
+      setDone({ id: resp.bet.id, status: resp.bet.status });
+      setGuardrailBlock(null);
+      onRecorded?.();
+    } catch (e: unknown) {
+      if (e instanceof SoccerGuardrailsBlockedError) {
+        setGuardrailBlock(e.report);
+        setForceUnlock(false);
+        setErr(null);
+      } else {
+        setErr(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (done) {
+    return (
+      <div className="mono" style={{
+        border: "1px solid var(--green-dim)",
+        background: "rgba(25,195,125,0.10)",
+        borderRadius: 3,
+        padding: "7px 8px",
+        marginBottom: 8,
+        color: "var(--green)",
+        fontSize: 10,
+      }}>
+        ✓ Bet #{done.id} recorded as {done.status.toUpperCase()}.
+        Track it in the BET JOURNAL panel — auto-grades on /resolve, manual mark won/lost otherwise.
+      </div>
+    );
+  }
+
+  const accent = gate.status === "BETTABLE" ? "var(--green)" : "var(--amber)";
+  const accentDim = gate.status === "BETTABLE" ? "var(--green-dim)" : "var(--amber-dim)";
+  return (
+    <div style={{
+      border: `1px solid ${accentDim}`,
+      borderRadius: 3,
+      padding: "7px 8px",
+      marginBottom: 8,
+      background: gate.status === "BETTABLE" ? "rgba(25,195,125,0.06)" : "rgba(255,196,80,0.06)",
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <div className="mono" style={{ color: accent, fontSize: 9, letterSpacing: "0.14em" }}>
+          RECORD BET TO JOURNAL
+        </div>
+        <div className="mono dim" style={{ fontSize: 9 }}>
+          {placedOdds != null
+            ? `${money(stake)} @ ${placedOdds.toFixed(2)} · ${gate.source.toUpperCase()}${ev != null ? ` · EV ${money(ev)}` : ""}`
+            : "no price yet"}
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 6, alignItems: "center" }}>
+        <label className="mono dim" style={{ fontSize: 9 }}>book</label>
+        <input
+          value={bookmaker}
+          onChange={(e) => setBookmaker(e.target.value)}
+          placeholder="bet365"
+          style={{
+            background: "var(--bg-3)", color: "var(--fg)",
+            border: "1px solid var(--border)", padding: "3px 6px",
+            borderRadius: 2, fontFamily: "var(--mono)", fontSize: 11, width: 110,
+          }}
+        />
+        <label className="mono dim" style={{ fontSize: 9 }}>note{reviewNeedsNote ? " (required for REVIEW)" : ""}</label>
+        <input
+          value={notes}
+          onChange={(e) => setNotes(e.target.value)}
+          placeholder={reviewNeedsNote ? "why you're betting anyway" : "optional"}
+          style={{
+            background: "var(--bg-3)", color: "var(--fg)",
+            border: `1px solid ${reviewNeedsNote && notes.trim().length === 0 ? "var(--amber-dim)" : "var(--border)"}`,
+            padding: "3px 6px", borderRadius: 2,
+            fontFamily: "var(--mono)", fontSize: 11, flex: "1 1 180px",
+            minWidth: 120,
+          }}
+        />
+        <button
+          onClick={record}
+          disabled={!recordEnabled}
+          style={{
+            background: gate.status === "BETTABLE" ? "rgba(25,195,125,0.20)" : "rgba(255,196,80,0.18)",
+            color: accent,
+            border: `1px solid ${accentDim}`,
+            padding: "4px 12px",
+            borderRadius: 2,
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            letterSpacing: "0.1em",
+            cursor: recordEnabled ? "pointer" : "not-allowed",
+            opacity: recordEnabled ? 1 : 0.5,
+          }}
+          title={
+            placedOdds == null
+              ? "Paste/verify book odds first"
+              : reviewNeedsNote && notes.trim().length === 0
+                ? "Add a note acknowledging the warning"
+                : "Persist this bet to the journal"
+          }
+        >{busy ? "RECORDING..." : forceUnlock && guardrailBlock ? "FORCE RECORD" : gate.status === "REVIEW" ? "RECORD REVIEW BET" : "RECORD BET"}</button>
+      </div>
+      {guardrailBlock ? (
+        <GuardrailBlockStrip
+          report={guardrailBlock}
+          force={forceUnlock}
+          onForceChange={setForceUnlock}
+          lineupConfirmed={lineupConfirmed}
+          onLineupChange={setLineupConfirmed}
+        />
+      ) : null}
+      {confirmingReview && reviewNeedsNote && notes.trim().length === 0 ? (
+        <div className="mono" style={{ color: "var(--amber)", fontSize: 9, marginTop: 6 }}>
+          REVIEW bets need a note explaining why you're betting despite the warning.
+        </div>
+      ) : null}
+      {err ? (
+        <div className="mono" style={{ color: "var(--red)", fontSize: 9, marginTop: 6 }}>
+          {err}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function GuardrailBlockStrip({
+  report,
+  force,
+  onForceChange,
+  lineupConfirmed,
+  onLineupChange,
+}: {
+  report: SoccerGuardrailReport;
+  force: boolean;
+  onForceChange: (v: boolean) => void;
+  lineupConfirmed: boolean;
+  onLineupChange: (v: boolean) => void;
+}) {
+  const failing = report.checks.filter((c) => !c.passed);
+  const hard = failing.filter((c) => c.severity === "hard");
+  const warns = failing.filter((c) => c.severity !== "hard");
+  const hasLineupBlock = hard.some((c) => c.rule === "player_prop_lineup");
+  return (
+    <div style={{
+      marginTop: 8,
+      border: "1px solid var(--red-dim)",
+      background: "rgba(220,80,80,0.08)",
+      borderRadius: 3,
+      padding: "7px 8px",
+    }}>
+      <div className="mono" style={{
+        color: "var(--red)", fontSize: 9, letterSpacing: "0.14em", marginBottom: 5,
+      }}>
+        SERVER GUARDRAILS BLOCKED THIS BET — {report.hard_fail_count} hard fail{report.hard_fail_count === 1 ? "" : "s"}
+        {report.warn_count ? ` · ${report.warn_count} warning${report.warn_count === 1 ? "" : "s"}` : ""}
+      </div>
+      <div style={{ display: "grid", gap: 4 }}>
+        {hard.map((c) => (
+          <div key={c.rule} className="mono" style={{ fontSize: 10, color: "var(--red)" }}>
+            ✗ <span style={{ color: "var(--fg-1)" }}>{c.label}</span> — {c.detail}
+          </div>
+        ))}
+        {warns.map((c) => (
+          <div key={c.rule} className="mono" style={{ fontSize: 10, color: "var(--amber)" }}>
+            ⚠ <span style={{ color: "var(--fg-1)" }}>{c.label}</span> — {c.detail}
+          </div>
+        ))}
+      </div>
+      {hasLineupBlock ? (
+        <label className="mono" style={{
+          display: "flex", alignItems: "center", gap: 6,
+          fontSize: 10, marginTop: 7, color: "var(--fg-1)", cursor: "pointer",
+        }}>
+          <input
+            type="checkbox"
+            checked={lineupConfirmed}
+            onChange={(e) => onLineupChange(e.target.checked)}
+          />
+          Confirm starting XI is locked (clears player-prop block)
+        </label>
+      ) : null}
+      <label className="mono" style={{
+        display: "flex", alignItems: "center", gap: 6,
+        fontSize: 10, marginTop: 7, color: "var(--red)", cursor: "pointer",
+      }}>
+        <input
+          type="checkbox"
+          checked={force}
+          onChange={(e) => onForceChange(e.target.checked)}
+        />
+        FORCE RECORD ANYWAY — I accept these guardrail failures.
+      </label>
+      <div className="mono dim" style={{ fontSize: 9, marginTop: 4 }}>
+        Hit RECORD BET again after toggling. Failing checks are persisted with the bet.
+      </div>
     </div>
   );
 }

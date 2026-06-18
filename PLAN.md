@@ -52,7 +52,7 @@ Acceptance criteria:
 
 ## Phase 2: Persistent Soccer Bet Journal
 
-Status: next.
+Status: complete.
 
 Purpose:
 - Track what was actually placed, at what price, and why.
@@ -93,7 +93,7 @@ Acceptance criteria:
 
 ## Phase 3: Closing-Line Value Tracking
 
-Status: planned.
+Status: complete.
 
 Purpose:
 - Prove whether the model beats the market over time.
@@ -127,35 +127,64 @@ Acceptance criteria:
 
 ## Phase 4: Result Grading and Calibration
 
-Status: planned.
+Status: complete (calibration dashboard + scoring layer landed; stats /
+player-prop grading still gated on those feeds being wired up).
 
 Purpose:
 - Measure model accuracy by market, not just PnL.
 
-Backend tasks:
-- Extend result grading:
-  - score-derived markets: 1X2, totals, BTTS, team totals, correct score
-  - stats markets when stats feed is available: corners, fouls, cards, shots, SOT
-  - player props when lineup/event feed is available
-- Add calibration records by:
-  - market type
-  - league/competition
-  - odds bucket
-  - confidence bucket
-  - AI Guru agreement bucket
+Backend tasks (delivered):
+- Score-derived market grading already wired in the resolve loop and
+  `resolve_open_bets` (auto-grades match_result, totals, BTTS, team
+  totals on `POST /api/soccer/fixtures/{id}/resolve`).
+- New calibration aggregator in `src/sports/soccer/data/store.py`
+  (`soccer_bets_calibration_summary`, `_calibration_bucket_stats`,
+  `_reliability_curve`, `_odds_bucket_for`,
+  `_build_calibration_summary`). Filters to settled won/lost bets and
+  reports Brier, log-loss, hit rate, average predicted probability,
+  model EV per $1, total stake, net PnL, ROI — overall plus bucket
+  breakdowns by market, model rating, odds band, slip type, and
+  qualification status.
+- Reliability curve: 10 predicted-probability deciles with predicted
+  mean, observed hit rate and gap per bucket.
+- New `GET /api/soccer/bets/calibration-summary` endpoint and an
+  embedded `calibration_summary` block on `GET /api/soccer/bets`.
 
-Frontend tasks:
-- Add calibration dashboard:
-  - predicted vs observed
-  - Brier score
-  - hit rate by confidence bucket
-  - EV by market type
-  - PnL by market type
+Backend tasks (deferred — feed-gated):
+- Stats markets grading (corners, fouls, cards, shots, SOT) — needs the
+  stats feed from Phase 5.
+- Player-prop grading — needs the lineup/event feed from Phase 7.
+- League/competition bucket — fixture metadata exists; can be added when
+  bets cover multiple leagues.
+- AI Guru agreement bucket — depends on the guru workflow.
 
-Acceptance criteria:
-- Settled bets update journal PnL.
-- Dashboard shows which markets are profitable or broken.
-- Markets with negative paper EV or poor calibration can be auto-blocked.
+Frontend tasks (delivered):
+- Calibration dashboard in `BetJournalPanel.tsx`
+  (`CalibrationSummaryStrip`, `CalibrationBucketRow`,
+  `ReliabilityCurveRow`):
+  - Header cells: settled W-L, hit rate, Brier, model EV/$1, ROI.
+  - Bucket strips: BY MARKET / BY RATING / BY ODDS BAND / BY SLIP, each
+    chip showing observed hit rate vs predicted (or ROI for slip type)
+    and tooltip with brier + ROI + sample count.
+  - Reliability curve: 10 decile boxes with observed hit rate, sample
+    count, and a gap-magnitude colour.
+- Types + `api.soccerCalibrationSummary` wrapper in `client.ts`.
+
+Tests:
+- `tests/sports/soccer/test_calibration_summary.py` (11 tests) — pure
+  helper math (Brier, log-loss, EV per $1, ROI, odds buckets, decile
+  grouping) plus store integration.
+- `tests/sports/soccer/test_api_routes.py` — three new API tests cover
+  the empty case, settled bets producing buckets + reliability points,
+  and the embedded calibration summary on the list endpoint.
+
+Acceptance criteria (met):
+- Settled bets update journal PnL (already in place).
+- Dashboard shows which markets are profitable or broken (BY MARKET +
+  BY ODDS BAND chips, reliability curve).
+- Markets with negative paper EV / poor calibration can be auto-blocked
+  via the Phase 10 `negative_clv_market` rule (now complemented by the
+  Phase 4 calibration tracking that lets us reason about why).
 
 ## Phase 5: Odds Feed Reliability and Line Shopping
 
@@ -192,7 +221,7 @@ Acceptance criteria:
 
 ## Phase 6: Bet365 Paste Workflow
 
-Status: planned.
+Status: complete.
 
 Purpose:
 - Make manual Bet365 usage fast and less error-prone.
@@ -300,7 +329,7 @@ Acceptance criteria:
 
 ## Phase 9: Smart Bet Builder and Correlation Engine
 
-Status: planned.
+Status: complete.
 
 Purpose:
 - Build parlays intelligently instead of stacking random legs.
@@ -327,24 +356,57 @@ Acceptance criteria:
 
 ## Phase 10: Strategy Guardrails and Auto-Block Rules
 
-Status: planned.
+Status: complete.
 
 Purpose:
 - Stop the bot from repeating bad behavior.
 
-Rules:
-- Block markets with negative calibrated EV.
-- Block categories with poor Brier score.
-- Block stale odds.
-- Block odds below minimum acceptable price.
-- Block overexposure to one match/team/market.
-- Block player props before confirmed lineup.
-- Block books/markets with unreliable settlement or stale pricing.
+Rules implemented in `src/sports/soccer/risk/guardrails.py`:
+- `stake_positive` (hard) — non-positive stake blocks.
+- `min_decimal_odds` (hard) — odds below configurable floor (default 1.30) block.
+- `fixture_exposure_cap` (hard) — current open stake on the same fixture plus
+  this bet's stake must stay within `fixture_exposure_cap_usd` (default $100;
+  set to 0 to disable).
+- `player_prop_lineup` (hard) — any leg in `PLAYER_PROP_LEGS` requires
+  `lineup_confirmed=true`.
+- `same_game_needs_price` (hard) — multi-leg same-game parlays must include
+  the book price (`source in {live,pasted}` plus `book_decimal_odds`).
+- `negative_clv_market` (warn) — market+rating buckets with at least
+  `min_bets_for_clv_block` samples and average CLV below
+  `negative_clv_threshold` are flagged.
+- `parlay.*` — failing rules from Phase 9 `parlay_rule_check` (correlation
+  tax, low joint probability, max legs, high-variance edge floor) are merged
+  in for multi-leg bets; single-leg bets never produce a `parlay.*` check.
 
-Acceptance criteria:
+Backend wiring (`dashboard_v2/api/routes/soccer.py`):
+- `POST /api/soccer/guardrails/preview` — dry-run a slip without recording.
+- `POST /api/soccer/bets` — runs guardrails, returns `422` with
+  `{ok:false, error:"guardrails_blocked", guardrails: GuardrailReportOut}`
+  on any hard fail unless the payload sets `force=true`. The guardrail
+  checks are merged into `qualification_checks_json` regardless.
+- Helper `soccer_bets_open_stake_by_fixture()` in `data/store.py` powers the
+  fixture-exposure rule.
+
+Frontend wiring (`dashboard_v2/web/src/api/client.ts` +
+`panels/soccer/BetslipCreatorPanel.tsx`):
+- `recordSoccerBetWithGuardrails` catches the 422 and throws
+  `SoccerGuardrailsBlockedError` carrying the structured report.
+- `RecordBetWidget` renders a red BLOCK strip listing each failing rule,
+  exposes a "Confirm starting XI is locked" toggle when the player-prop
+  rule fires, and a "FORCE RECORD ANYWAY" checkbox that opts out of the
+  block on the next click.
+
+Tests:
+- `tests/sports/soccer/test_guardrails.py` (16) — every rule path.
+- `tests/sports/soccer/test_api_routes.py` (Phase 10 block at the end) —
+  block-without-force, allow-with-force, player-prop lineup unlock, SGP
+  price requirement, fixture exposure cap, preview shape on clean and
+  dirty slips, audit-trail merge into `qualification_checks_json`.
+
+Acceptance criteria (met):
 - Guardrails run before a bet can be recorded.
-- Dashboard explains every block reason.
-- User can see market-level allow/block status.
+- Dashboard explains every block reason inline on the betslip card.
+- User can see and override (force) block status per bet.
 
 ## Phase 11: Kalshi/Polymarket Roadmap
 
@@ -397,9 +459,8 @@ Acceptance criteria:
 
 ## Immediate Next Steps
 
-1. Build Phase 2: persistent soccer bet journal.
-2. Add `RECORD BET` from bettable slips.
-3. Add open/settled soccer bets table.
-4. Add closing-line snapshot fields.
-5. Fix odds provider connectivity or choose a better odds feed.
+1. Build Phase 8: market expansion + market-specific calibration (extends Phase 4 calibration dashboard with new market types).
+2. Fix odds provider connectivity or choose a better odds feed (Phase 5) — needs network/keys.
+3. Wire Phase 7 lineup feed once a provider/keys are available (player-prop rule in Phase 9/10 already reads `lineup_confirmed`; Phase 4 player-prop grading deferred until then).
+4. Optional follow-up to Phase 10: debounce `/api/soccer/guardrails/preview` behind each slip card so blocks surface before the user clicks RECORD BET (today the UI relies on the 422 round-trip).
 

@@ -224,6 +224,19 @@ export type SoccerBetLeg = {
   label?: string | null;
 };
 
+export type SoccerParlayRule = {
+  rule: string;
+  passed: boolean;
+  severity: "hard" | "warn" | string;
+  detail: string;
+};
+
+export type SoccerFailureMode = {
+  legs: string[];
+  share: number;
+  why: string;
+};
+
 export type SoccerBetBuilderQuote = {
   fair_probability: number;
   fair_decimal_odds: number;
@@ -240,6 +253,73 @@ export type SoccerBetBuilderQuote = {
   risk_level: string;
   risk_flags: string[];
   ai_review: string | null;
+  // Phase 9 — Smart Bet Builder & Correlation Engine
+  book_implied_probability: number | null;
+  correlation_tax: number | null;
+  correlation_tax_pct: number | null;
+  parlay_rules: SoccerParlayRule[];
+  parlay_rules_passed: boolean;
+  parlay_rules_hard_fail: boolean;
+  failure_modes: SoccerFailureMode[];
+  leg_failure_rates: number[];
+  duplicate_exposure_groups: number[][];
+};
+
+// Phase 6 — Bet365 paste workflow
+export type ParsedBet365Leg = {
+  selection: string;
+  market: string | null;
+  decimal_odds: number | null;
+  kind: string | null;
+  params: Record<string, unknown>;
+  team_hint: string | null;
+  player_hint: string | null;
+  line_hint: number | null;
+  side_hint: string | null;
+  raw_lines: string[];
+};
+
+export type ParsedBet365Slip = {
+  legs: ParsedBet365Leg[];
+  combined_decimal_odds: number | null;
+  stake: number | null;
+  returns: number | null;
+  slip_type: string;
+  unrecognised_lines: string[];
+  notes: string[];
+};
+
+export type LegMatch = {
+  parsed_index: number;
+  matched_model_index: number | null;
+  confidence: number;
+  reason: string;
+  issues: string[];
+};
+
+export type Bet365PasteResponse = {
+  parsed: ParsedBet365Slip;
+  matches: LegMatch[];
+  unmatched_parsed_legs: number[];
+  unmatched_model_legs: number[];
+  overall_match_confidence: number;
+  matched_slip_id: string | null;
+  matched_fixture_id: string | null;
+  matched_legs_count: number;
+  model_legs_count: number;
+  reprice: SoccerBetBuilderQuote | null;
+  reprice_error: string | null;
+  gate_blocking_issues: string[];
+};
+
+export type Bet365PastePayload = {
+  slip_text: string;
+  fixture_id?: string;
+  slip_id?: string;
+  model_legs?: SoccerBetLeg[];
+  n_sims?: number;
+  same_game?: boolean;
+  lineup_confirmed?: boolean;
 };
 
 export type SoccerOddsLeg = {
@@ -373,6 +453,236 @@ export type SoccerResolveResult = {
   bet_builder_graded: number;
   skipped_unsupported_market: number;
   calibration_records: number;
+  soccer_bets_graded: number;
+  soccer_bets_skipped: number;
+};
+
+/* ---------- Soccer Bet Journal (Phase 2) ---------- */
+
+export type SoccerBetSource = "live" | "pasted" | "manual";
+
+export type SoccerBetStatus =
+  | "open"
+  | "won"
+  | "lost"
+  | "pushed"
+  | "void"
+  | "cashed_out";
+
+export type SoccerBetQualificationCheck = {
+  label: string;
+  pass: boolean;
+  detail?: string | null;
+  severity?: string | null;
+};
+
+export type SoccerBetLegRecord = {
+  kind: string;
+  label?: string | null;
+  params: Record<string, unknown>;
+};
+
+export type SoccerBet = {
+  id: number;
+  slip_id: string | null;
+  fixture_id: string;
+  match_label: string | null;
+  slip_type: string | null;
+  title: string | null;
+  legs: SoccerBetLegRecord[];
+  model_probability: number;
+  fair_decimal_odds: number;
+  placed_decimal_odds: number;
+  stake_usd: number;
+  expected_value_usd: number | null;
+  edge: number | null;
+  kelly_fraction: number | null;
+  qualification_status: string;
+  qualification_checks: SoccerBetQualificationCheck[] | null;
+  source: SoccerBetSource;
+  bookmaker: string | null;
+  notes: string | null;
+  status: SoccerBetStatus;
+  created_unix: number;
+  placed_unix: number;
+  settled_unix: number | null;
+  pnl_usd: number | null;
+  actual_return_usd: number | null;
+  closing_decimal: number | null;
+  closing_source: string | null;
+  closing_unix: number | null;
+  clv_pct: number | null;
+};
+
+export type SoccerBetMatchExposure = {
+  match_label: string;
+  n: number;
+  stake_usd: number;
+  max_return_usd: number;
+};
+
+export type SoccerBetExposure = {
+  open_count: number;
+  open_stake_usd: number;
+  open_max_return_usd: number;
+  by_match: SoccerBetMatchExposure[];
+};
+
+export type SoccerBetSettledSummary = {
+  won: number;
+  lost: number;
+  pushed: number;
+  void: number;
+  cashed_out: number;
+  net_pnl_usd: number;
+};
+
+export type SoccerBetClvBucket = {
+  bucket: string;
+  count: number;
+  count_with_clv: number;
+  avg_clv_pct: number | null;
+  positive_clv_share: number | null;
+  net_pnl_usd: number;
+};
+
+export type SoccerBetClvOverall = {
+  count: number;
+  count_with_clv: number;
+  avg_clv_pct: number | null;
+  positive_clv_share: number | null;
+  net_pnl_usd: number;
+};
+
+export type SoccerBetClvSummary = {
+  overall: SoccerBetClvOverall;
+  by_market: SoccerBetClvBucket[];
+  by_slip_type: SoccerBetClvBucket[];
+  by_source: SoccerBetClvBucket[];
+  by_rating_bucket: SoccerBetClvBucket[];
+};
+
+export type SoccerBetCalibrationOverall = {
+  count: number;
+  won: number;
+  hit_rate: number | null;
+  avg_predicted: number | null;
+  brier: number | null;
+  log_loss: number | null;
+  ev_per_dollar: number | null;
+  total_stake_usd: number;
+  net_pnl_usd: number;
+  roi: number | null;
+};
+
+export type SoccerBetCalibrationBucket = SoccerBetCalibrationOverall & {
+  bucket: string;
+};
+
+export type SoccerBetCalibrationCurvePoint = {
+  bucket: string;
+  p_lo: number;
+  p_hi: number;
+  count: number;
+  avg_predicted: number | null;
+  observed_hit_rate: number | null;
+  gap: number | null;
+};
+
+export type SoccerBetCalibrationSummary = {
+  overall: SoccerBetCalibrationOverall;
+  by_market: SoccerBetCalibrationBucket[];
+  by_rating_bucket: SoccerBetCalibrationBucket[];
+  by_odds_bucket: SoccerBetCalibrationBucket[];
+  by_slip_type: SoccerBetCalibrationBucket[];
+  by_qualification_status: SoccerBetCalibrationBucket[];
+  reliability_curve: SoccerBetCalibrationCurvePoint[];
+};
+
+export type SoccerBetListResponse = {
+  bets: SoccerBet[];
+  exposure: SoccerBetExposure;
+  settled: SoccerBetSettledSummary;
+  clv_summary?: SoccerBetClvSummary | null;
+  calibration_summary?: SoccerBetCalibrationSummary | null;
+};
+
+export type SnapshotClosingPayload = {
+  closing_decimal: number;
+  closing_source?: string | null;
+  closing_unix?: number | null;
+};
+
+export type SoccerBetCreated = {
+  ok: boolean;
+  bet: SoccerBet;
+  guardrails?: SoccerGuardrailReport | null;
+};
+
+export type SoccerGuardrailCheck = {
+  rule: string;
+  label: string;
+  passed: boolean;
+  severity: "hard" | "warn" | string;
+  detail: string;
+};
+
+export type SoccerGuardrailReport = {
+  allowed: boolean;
+  hard_fail_count: number;
+  warn_count: number;
+  blocking_reasons: string[];
+  checks: SoccerGuardrailCheck[];
+};
+
+export type SoccerGuardrailPreviewPayload = {
+  fixture_id: string;
+  legs: SoccerBetLegRecord[];
+  placed_decimal_odds: number;
+  stake_usd: number;
+  source: SoccerBetSource;
+  book_decimal_odds?: number | null;
+  edge?: number | null;
+  same_game?: boolean;
+  lineup_confirmed?: boolean;
+};
+
+export type RecordSoccerBetPayload = {
+  fixture_id: string;
+  legs: SoccerBetLegRecord[];
+  model_probability: number;
+  fair_decimal_odds: number;
+  placed_decimal_odds: number;
+  stake_usd: number;
+  qualification_status: string;
+  source: SoccerBetSource;
+  slip_id?: string | null;
+  match_label?: string | null;
+  slip_type?: string | null;
+  title?: string | null;
+  expected_value_usd?: number | null;
+  edge?: number | null;
+  kelly_fraction?: number | null;
+  qualification_checks?: SoccerBetQualificationCheck[];
+  bookmaker?: string | null;
+  notes?: string | null;
+  force?: boolean;
+  lineup_confirmed?: boolean;
+  same_game?: boolean;
+  book_decimal_odds?: number | null;
+};
+
+export type UpdateSoccerBetPayload = {
+  status?: SoccerBetStatus;
+  placed_decimal_odds?: number;
+  notes?: string;
+  pnl_usd?: number;
+  actual_return_usd?: number;
+  settled_unix?: number;
+  closing_decimal?: number;
+  closing_source?: string;
+  closing_unix?: number;
+  clv_pct?: number;
 };
 
 async function getJSON<T>(path: string): Promise<T> {
@@ -388,6 +698,53 @@ async function postJSON<T>(path: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   });
   if (!r.ok) throw new Error(`${path} → ${r.status}`);
+  return r.json();
+}
+
+async function patchJSON<T>(path: string, body: unknown): Promise<T> {
+  const r = await fetch(path, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    let detail = "";
+    try {
+      const j = await r.json();
+      detail = j?.detail ? `: ${j.detail}` : "";
+    } catch { /* swallow */ }
+    throw new Error(`${path} → ${r.status}${detail}`);
+  }
+  return r.json();
+}
+
+/** Raised by recordSoccerBet when the server-side Phase 10 guardrails
+ * block the bet and the caller did not pass `force: true`. */
+export class SoccerGuardrailsBlockedError extends Error {
+  report: SoccerGuardrailReport;
+  constructor(report: SoccerGuardrailReport) {
+    super(`Guardrails blocked the bet (${report.hard_fail_count} hard fail${report.hard_fail_count === 1 ? "" : "s"}).`);
+    this.name = "SoccerGuardrailsBlockedError";
+    this.report = report;
+  }
+}
+
+async function recordSoccerBetWithGuardrails(
+  payload: RecordSoccerBetPayload,
+): Promise<SoccerBetCreated> {
+  const r = await fetch("/api/soccer/bets", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (r.status === 422) {
+    let body: { guardrails?: SoccerGuardrailReport } = {};
+    try { body = await r.json(); } catch { /* swallow */ }
+    if (body.guardrails) {
+      throw new SoccerGuardrailsBlockedError(body.guardrails);
+    }
+  }
+  if (!r.ok) throw new Error(`/api/soccer/bets → ${r.status}`);
   return r.json();
 }
 
@@ -456,7 +813,12 @@ export const api = {
                 book_decimal_odds?: number | null;
                 n_sims?: number;
                 persist?: boolean;
+                source?: "live" | "pasted" | "manual" | "none";
+                lineup_confirmed?: boolean;
+                same_game?: boolean;
               }) => postJSON<SoccerBetBuilderQuote>("/api/soccer/bet-builder", payload),
+  soccerPasteBet365: (payload: Bet365PastePayload) =>
+              postJSON<Bet365PasteResponse>("/api/soccer/paste/bet365", payload),
   soccerOdds:     (fixtureId: string, legs?: string) =>
               getJSON<SoccerOddsForFixture>(
                 `/api/soccer/odds/${encodeURIComponent(fixtureId)}${legs ? `?legs=${encodeURIComponent(legs)}` : ""}`,
@@ -500,6 +862,32 @@ export const api = {
               }) => postJSON<{ ok: boolean; prediction_id: number }>(
                 "/api/soccer/predictions", payload,
               ),
+  soccerRecordBet: (payload: RecordSoccerBetPayload) =>
+              recordSoccerBetWithGuardrails(payload),
+  soccerGuardrailsPreview: (payload: SoccerGuardrailPreviewPayload) =>
+              postJSON<SoccerGuardrailReport>("/api/soccer/guardrails/preview", payload),
+  soccerListBets: (params?: {
+                status?: string; fixture_id?: string;
+                since_unix?: number; limit?: number;
+              }) => {
+              const qs = new URLSearchParams();
+              if (params?.status)      qs.set("status", params.status);
+              if (params?.fixture_id)  qs.set("fixture_id", params.fixture_id);
+              if (params?.since_unix != null) qs.set("since_unix", String(params.since_unix));
+              if (params?.limit != null)      qs.set("limit", String(params.limit));
+              const suffix = qs.toString() ? `?${qs.toString()}` : "";
+              return getJSON<SoccerBetListResponse>(`/api/soccer/bets${suffix}`);
+            },
+  soccerUpdateBet: (betId: number, payload: UpdateSoccerBetPayload) =>
+              patchJSON<SoccerBet>(`/api/soccer/bets/${betId}`, payload),
+  soccerSnapshotClosing: (betId: number, payload: SnapshotClosingPayload) =>
+              postJSON<SoccerBet>(
+                `/api/soccer/bets/${betId}/snapshot-closing`, payload,
+              ),
+  soccerClvSummary: () =>
+              getJSON<SoccerBetClvSummary>("/api/soccer/bets/clv-summary"),
+  soccerCalibrationSummary: () =>
+              getJSON<SoccerBetCalibrationSummary>("/api/soccer/bets/calibration-summary"),
 };
 
 /* ----- WebSocket with auto-reconnect ----- */

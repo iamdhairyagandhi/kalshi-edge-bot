@@ -16,6 +16,8 @@ import BetBuilderPanel from "./BetBuilderPanel";
 import SoccerCalibrationPanel from "./SoccerCalibrationPanel";
 import EdgeBoardPanel from "./EdgeBoardPanel";
 import BetslipCreatorPanel from "./BetslipCreatorPanel";
+import BetJournalPanel from "./BetJournalPanel";
+import Bet365PastePanel from "./Bet365PastePanel";
 
 export default function SoccerTab() {
   const [fixtures, setFixtures] = useState<SoccerFixture[]>([]);
@@ -28,6 +30,8 @@ export default function SoccerTab() {
   const [presetLegs, setPresetLegs] = useState<SoccerBetLeg[]>([]);
   const [presetKey, setPresetKey] = useState(0);
   const [presetBookOdds, setPresetBookOdds] = useState<number | null>(null);
+  // Bumped whenever a bet is recorded so the journal panel refetches.
+  const [journalRefresh, setJournalRefresh] = useState(0);
 
   async function refreshFixtures() {
     try {
@@ -179,7 +183,11 @@ export default function SoccerTab() {
       </section>
 
       <section className="soccer-slip">
-        <BetslipCreatorPanel onUseLegs={useLegsInBuilder} onSelectFixture={setSelectedId} />
+        <BetslipCreatorPanel
+          onUseLegs={useLegsInBuilder}
+          onSelectFixture={setSelectedId}
+          onBetRecorded={() => setJournalRefresh((n) => n + 1)}
+        />
       </section>
 
       <section className="soccer-builder">
@@ -189,6 +197,18 @@ export default function SoccerTab() {
           presetKey={presetKey}
           presetBookOdds={presetBookOdds}
         />
+      </section>
+
+      <section className="soccer-paste">
+        <Bet365PastePanel
+          match={match}
+          fixtures={fixtures}
+          presetLegs={presetLegs}
+        />
+      </section>
+
+      <section className="soccer-journal">
+        <BetJournalPanel refreshKey={journalRefresh} />
       </section>
 
       <section className="soccer-calibration">

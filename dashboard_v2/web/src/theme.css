@@ -298,12 +298,14 @@ table.tight tr:hover td { background: var(--bg-3); }
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(330px, 0.78fr) minmax(520px, 1.34fr) minmax(390px, 0.95fr);
-  grid-template-rows: 62px minmax(250px, 0.78fr) minmax(315px, 1fr) minmax(230px, 0.62fr);
+  grid-template-rows: 62px minmax(250px, 0.78fr) minmax(315px, 1fr) minmax(230px, 0.62fr) minmax(280px, 0.85fr) minmax(280px, 0.85fr);
   grid-template-areas:
-    "rail status slip"
-    "rail match  slip"
-    "rail edge   slip"
-    "rail builder calibration";
+    "rail status  slip"
+    "rail match   slip"
+    "rail edge    slip"
+    "rail builder calibration"
+    "paste paste paste"
+    "journal journal journal";
   gap: 8px;
   padding: 8px;
   overflow: auto;
@@ -321,6 +323,8 @@ table.tight tr:hover td { background: var(--bg-3); }
 .soccer-slip { grid-area: slip; }
 .soccer-builder { grid-area: builder; }
 .soccer-calibration { grid-area: calibration; }
+.soccer-paste { grid-area: paste; }
+.soccer-journal { grid-area: journal; }
 
 .soccer-status-card {
   height: 100%;
@@ -377,6 +381,8 @@ table.tight tr:hover td { background: var(--bg-3); }
       "edge"
       "slip"
       "builder"
+      "paste"
+      "journal"
       "calibration";
     overflow: visible;
   }

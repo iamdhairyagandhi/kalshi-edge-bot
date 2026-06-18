@@ -370,6 +370,18 @@ export default function BetBuilderPanel({ match, presetLegs, presetKey, presetBo
                         value={quote.edge != null ? `${(quote.edge * 100).toFixed(2)}%` : "—"}
                         sub={`kelly ${quote.kelly_fraction != null ? (quote.kelly_fraction * 100).toFixed(2) : "0.00"}%`}
                         color={(quote.edge ?? 0) > 0 ? "var(--green)" : "var(--red)"} />
+                  {quote.correlation_tax != null ? (
+                    <Stat
+                      label="CORRELATION TAX"
+                      value={`${(quote.correlation_tax * 100).toFixed(2)}%`}
+                      sub={
+                        quote.correlation_tax_pct != null
+                          ? `${quote.correlation_tax_pct >= 0 ? "+" : ""}${(quote.correlation_tax_pct * 100).toFixed(1)}% of joint`
+                          : undefined
+                      }
+                      color={quote.correlation_tax >= 0 ? "var(--amber)" : "var(--green)"}
+                    />
+                  ) : null}
                 </>
               )}
               <div style={{
@@ -377,6 +389,76 @@ export default function BetBuilderPanel({ match, presetLegs, presetKey, presetBo
                 fontFamily: "var(--mono)", fontSize: 12, color: recColor,
                 letterSpacing: "0.15em", textAlign: "center", marginTop: 6,
               }}>{quote.recommendation.toUpperCase()}</div>
+              {quote.parlay_rules && quote.parlay_rules.length > 0 ? (
+                <div>
+                  <div className="mono dim" style={{ fontSize: 10, letterSpacing: "0.15em", marginBottom: 4 }}>
+                    PARLAY RULES {quote.parlay_rules_hard_fail ? "(HARD FAIL)" : ""}
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                    {quote.parlay_rules.map((rule) => {
+                      const color = rule.passed
+                        ? "var(--green)"
+                        : rule.severity === "hard"
+                        ? "var(--red)"
+                        : "var(--amber)";
+                      const icon = rule.passed ? "✓" : rule.severity === "hard" ? "✕" : "!";
+                      return (
+                        <div
+                          key={rule.rule}
+                          className="mono"
+                          style={{
+                            fontSize: 10,
+                            color,
+                            borderLeft: `2px solid ${color}`,
+                            paddingLeft: 6,
+                            lineHeight: 1.3,
+                          }}
+                          title={rule.rule}
+                        >
+                          {icon} {rule.detail}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
+              {quote.failure_modes && quote.failure_modes.length > 0 ? (
+                <div>
+                  <div className="mono dim" style={{ fontSize: 10, letterSpacing: "0.15em", marginBottom: 4 }}>
+                    WHY THIS PARLAY COULD LOSE
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                    {quote.failure_modes.map((mode, i) => (
+                      <div
+                        key={i}
+                        className="mono"
+                        style={{
+                          fontSize: 10,
+                          color: "var(--fg-2)",
+                          background: "rgba(255,180,60,0.06)",
+                          borderLeft: "2px solid var(--amber)",
+                          padding: "2px 6px",
+                          lineHeight: 1.3,
+                        }}
+                      >
+                        <span style={{ color: "var(--amber)", marginRight: 6 }}>
+                          {(mode.share * 100).toFixed(0)}%
+                        </span>
+                        {mode.why}
+                      </div>
+                    ))}
+                  </div>
+                  {quote.leg_failure_rates && quote.leg_failure_rates.length > 0 ? (
+                    <div className="mono dim" style={{ fontSize: 9, marginTop: 4 }}>
+                      {quote.leg_failure_rates.map((r, i) => (
+                        <span key={i} style={{ marginRight: 10 }}>
+                          leg {i + 1}: {(r * 100).toFixed(0)}% fail rate
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
               {quote.risk_flags.length > 0 ? (
                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                   {quote.risk_flags.map((flag) => (

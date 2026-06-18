@@ -21,11 +21,12 @@ import logging
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import httpx
 from fastapi import APIRouter, Body, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from src.config import settings
@@ -47,7 +48,18 @@ from src.sports.soccer.models.player_share import PlayerShareModel
 from src.sports.soccer.models.xg import XgModel, aggregate_match_xg
 from src.sports.soccer.pricing.edge import report_edge
 from src.sports.soccer.ratings.elo import EloTable
+from src.sports.soccer.parsers import (
+    ParsedBet365Slip,
+    parse_bet365_slip,
+    match_parsed_slip,
+)
+from src.sports.soccer.risk import (
+    GuardrailConfig,
+    GuardrailReport,
+    evaluate_guardrails,
+)
 from src.sports.soccer.simulator.bet_builder import price_bet_builder
+from src.sports.soccer.simulator.correlation import build_correlation_report
 from src.sports.soccer.simulator.match_sim import (
     MatchSimulator,
     SimulationConfig,
@@ -118,6 +130,22 @@ class BetBuilderIn(BaseModel):
     book_decimal_odds: Optional[float] = None
     n_sims: int = Field(default=10000, ge=500, le=50000)
     persist: bool = False
+    source: str = Field(default="live")           # "live" | "pasted" | "manual" | "none"
+    lineup_confirmed: bool = Field(default=False)
+    same_game: bool = Field(default=True)
+
+
+class ParlayRuleOut(BaseModel):
+    rule: str
+    passed: bool
+    severity: str
+    detail: str
+
+
+class FailureModeOut(BaseModel):
+    legs: List[str]
+    share: float
+    why: str
 
 
 class BetBuilderOut(BaseModel):
@@ -136,6 +164,76 @@ class BetBuilderOut(BaseModel):
     risk_level: str = "unknown"
     risk_flags: List[str] = Field(default_factory=list)
     ai_review: Optional[str] = None
+    # Phase 9 — Smart Bet Builder & Correlation Engine
+    book_implied_probability: Optional[float] = None
+    correlation_tax: Optional[float] = None
+    correlation_tax_pct: Optional[float] = None
+    parlay_rules: List[ParlayRuleOut] = Field(default_factory=list)
+    parlay_rules_passed: bool = True
+    parlay_rules_hard_fail: bool = False
+    failure_modes: List[FailureModeOut] = Field(default_factory=list)
+    leg_failure_rates: List[float] = Field(default_factory=list)
+    duplicate_exposure_groups: List[List[int]] = Field(default_factory=list)
+
+
+# Phase 6 — Bet365 paste workflow
+class Bet365PasteIn(BaseModel):
+    slip_text: str
+    fixture_id: Optional[str] = None
+    slip_id: Optional[str] = None
+    # Optional list of model legs to match the parsed legs against.  When
+    # omitted the response is parse-only (no matching, no reprice).
+    model_legs: List[BetLegIn] = Field(default_factory=list)
+    n_sims: int = Field(default=8000, ge=500, le=50000)
+    # Hint for the correlation rule: assume same-game parlay by default.
+    same_game: bool = True
+    lineup_confirmed: bool = False
+
+
+class ParsedBet365LegOut(BaseModel):
+    selection: str
+    market: Optional[str] = None
+    decimal_odds: Optional[float] = None
+    kind: Optional[str] = None
+    params: Dict[str, object] = Field(default_factory=dict)
+    team_hint: Optional[str] = None
+    player_hint: Optional[str] = None
+    line_hint: Optional[float] = None
+    side_hint: Optional[str] = None
+    raw_lines: List[str] = Field(default_factory=list)
+
+
+class ParsedBet365SlipOut(BaseModel):
+    legs: List[ParsedBet365LegOut] = Field(default_factory=list)
+    combined_decimal_odds: Optional[float] = None
+    stake: Optional[float] = None
+    returns: Optional[float] = None
+    slip_type: str = "single"
+    unrecognised_lines: List[str] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
+
+
+class LegMatchOut(BaseModel):
+    parsed_index: int
+    matched_model_index: Optional[int] = None
+    confidence: float
+    reason: str
+    issues: List[str] = Field(default_factory=list)
+
+
+class Bet365PasteOut(BaseModel):
+    parsed: ParsedBet365SlipOut
+    matches: List[LegMatchOut] = Field(default_factory=list)
+    unmatched_parsed_legs: List[int] = Field(default_factory=list)
+    unmatched_model_legs: List[int] = Field(default_factory=list)
+    overall_match_confidence: float = 0.0
+    matched_slip_id: Optional[str] = None
+    matched_fixture_id: Optional[str] = None
+    matched_legs_count: int = 0
+    model_legs_count: int = 0
+    reprice: Optional[BetBuilderOut] = None
+    reprice_error: Optional[str] = None
+    gate_blocking_issues: List[str] = Field(default_factory=list)
 
 
 class CalibrationOut(BaseModel):
@@ -173,6 +271,265 @@ class ResolveResultOut(BaseModel):
     bet_builder_graded: int
     skipped_unsupported_market: int
     calibration_records: int
+    soccer_bets_graded: int = 0
+    soccer_bets_skipped: int = 0
+
+
+# ----------------------------------------------------------------------
+# Phase 2 — Soccer Bet Journal schemas
+# ----------------------------------------------------------------------
+
+class SoccerBetLegRecord(BaseModel):
+    """Canonical leg shape persisted in soccer_bets.legs_json. We use a
+    permissive container so any kind/params combination already handled
+    by the resolution loop can be stored verbatim."""
+    kind: str
+    label: Optional[str] = None
+    params: Dict[str, object] = Field(default_factory=dict)
+
+
+class SoccerBetQualificationCheck(BaseModel):
+    label: str
+    pass_: bool = Field(default=True, alias="pass")
+    detail: Optional[str] = None
+    severity: Optional[str] = None
+
+    model_config = {"populate_by_name": True}
+
+
+class RecordSoccerBetIn(BaseModel):
+    """Body for POST /api/soccer/bets — what the user actually placed.
+
+    The frontend sends the slip+gate snapshot it already computed so the
+    journal can show "why it qualified" even after odds change. `legs`
+    must be the canonical BetLeg shape; the resolution loop uses it to
+    auto-grade after the fixture closes.
+
+    Phase 10: `force` lets the caller bypass Phase 10 hard fails after
+    explicitly confirming; `lineup_confirmed` and `same_game` feed the
+    guardrail engine."""
+    fixture_id: str
+    legs: List[SoccerBetLegRecord]
+    model_probability: float = Field(ge=0.0, le=1.0)
+    fair_decimal_odds: float = Field(gt=1.0)
+    placed_decimal_odds: float = Field(gt=1.0)
+    stake_usd: float = Field(ge=0.0)
+    qualification_status: str
+    source: str = Field(default="manual")
+    slip_id: Optional[str] = None
+    match_label: Optional[str] = None
+    slip_type: Optional[str] = None
+    title: Optional[str] = None
+    expected_value_usd: Optional[float] = None
+    edge: Optional[float] = None
+    kelly_fraction: Optional[float] = None
+    qualification_checks: Optional[List[SoccerBetQualificationCheck]] = None
+    bookmaker: Optional[str] = None
+    notes: Optional[str] = None
+    force: bool = False
+    lineup_confirmed: bool = False
+    same_game: bool = True
+    book_decimal_odds: Optional[float] = None
+
+
+class UpdateSoccerBetIn(BaseModel):
+    """Body for PATCH /api/soccer/bets/{id}. All fields optional; only
+    set fields are written. Status transitions out of 'open' are one-way
+    in the store layer."""
+    status: Optional[str] = None
+    placed_decimal_odds: Optional[float] = Field(default=None, gt=1.0)
+    notes: Optional[str] = None
+    pnl_usd: Optional[float] = None
+    actual_return_usd: Optional[float] = Field(default=None, ge=0.0)
+    settled_unix: Optional[int] = None
+    closing_decimal: Optional[float] = Field(default=None, gt=1.0)
+    closing_source: Optional[str] = None
+    closing_unix: Optional[int] = None
+    clv_pct: Optional[float] = None
+
+
+class SoccerBetOut(BaseModel):
+    id: int
+    slip_id: Optional[str] = None
+    fixture_id: str
+    match_label: Optional[str] = None
+    slip_type: Optional[str] = None
+    title: Optional[str] = None
+    legs: List[Dict[str, object]] = Field(default_factory=list)
+    model_probability: float
+    fair_decimal_odds: float
+    placed_decimal_odds: float
+    stake_usd: float
+    expected_value_usd: Optional[float] = None
+    edge: Optional[float] = None
+    kelly_fraction: Optional[float] = None
+    qualification_status: str
+    qualification_checks: Optional[List[Dict[str, object]]] = None
+    source: str
+    bookmaker: Optional[str] = None
+    notes: Optional[str] = None
+    status: str
+    created_unix: int
+    placed_unix: int
+    settled_unix: Optional[int] = None
+    pnl_usd: Optional[float] = None
+    actual_return_usd: Optional[float] = None
+    closing_decimal: Optional[float] = None
+    closing_source: Optional[str] = None
+    closing_unix: Optional[int] = None
+    clv_pct: Optional[float] = None
+
+
+class SoccerBetMatchExposureOut(BaseModel):
+    match_label: str
+    n: int
+    stake_usd: float
+    max_return_usd: float
+
+
+class SoccerBetExposureOut(BaseModel):
+    open_count: int
+    open_stake_usd: float
+    open_max_return_usd: float
+    by_match: List[SoccerBetMatchExposureOut] = Field(default_factory=list)
+
+
+class SoccerBetSettledSummaryOut(BaseModel):
+    won: int = 0
+    lost: int = 0
+    pushed: int = 0
+    void: int = 0
+    cashed_out: int = 0
+    net_pnl_usd: float = 0.0
+
+
+class SoccerBetClvBucketOut(BaseModel):
+    """One row of a CLV aggregate (by market / slip type / source / rating)."""
+    bucket: str
+    count: int = 0
+    count_with_clv: int = 0
+    avg_clv_pct: Optional[float] = None
+    positive_clv_share: Optional[float] = None
+    net_pnl_usd: float = 0.0
+
+
+class SoccerBetClvOverallOut(BaseModel):
+    count: int = 0
+    count_with_clv: int = 0
+    avg_clv_pct: Optional[float] = None
+    positive_clv_share: Optional[float] = None
+    net_pnl_usd: float = 0.0
+
+
+class SoccerBetClvSummaryOut(BaseModel):
+    overall: SoccerBetClvOverallOut
+    by_market: List[SoccerBetClvBucketOut] = Field(default_factory=list)
+    by_slip_type: List[SoccerBetClvBucketOut] = Field(default_factory=list)
+    by_source: List[SoccerBetClvBucketOut] = Field(default_factory=list)
+    by_rating_bucket: List[SoccerBetClvBucketOut] = Field(default_factory=list)
+
+
+class SoccerBetCalibrationOverallOut(BaseModel):
+    """Phase 4 — calibration overall stats block."""
+    count: int = 0
+    won: int = 0
+    hit_rate: Optional[float] = None
+    avg_predicted: Optional[float] = None
+    brier: Optional[float] = None
+    log_loss: Optional[float] = None
+    ev_per_dollar: Optional[float] = None
+    total_stake_usd: float = 0.0
+    net_pnl_usd: float = 0.0
+    roi: Optional[float] = None
+
+
+class SoccerBetCalibrationBucketOut(SoccerBetCalibrationOverallOut):
+    """Per-bucket row — overall stats plus the bucket label."""
+    bucket: str
+
+
+class SoccerBetCalibrationCurvePointOut(BaseModel):
+    """One reliability-curve decile (predicted prob vs observed hit rate)."""
+    bucket: str
+    p_lo: float
+    p_hi: float
+    count: int = 0
+    avg_predicted: Optional[float] = None
+    observed_hit_rate: Optional[float] = None
+    gap: Optional[float] = None
+
+
+class SoccerBetCalibrationSummaryOut(BaseModel):
+    overall: SoccerBetCalibrationOverallOut
+    by_market: List[SoccerBetCalibrationBucketOut] = Field(default_factory=list)
+    by_rating_bucket: List[SoccerBetCalibrationBucketOut] = Field(default_factory=list)
+    by_odds_bucket: List[SoccerBetCalibrationBucketOut] = Field(default_factory=list)
+    by_slip_type: List[SoccerBetCalibrationBucketOut] = Field(default_factory=list)
+    by_qualification_status: List[SoccerBetCalibrationBucketOut] = Field(default_factory=list)
+    reliability_curve: List[SoccerBetCalibrationCurvePointOut] = Field(default_factory=list)
+
+
+class SoccerBetListOut(BaseModel):
+    bets: List[SoccerBetOut] = Field(default_factory=list)
+    exposure: SoccerBetExposureOut
+    settled: SoccerBetSettledSummaryOut
+    clv_summary: Optional[SoccerBetClvSummaryOut] = None
+    calibration_summary: Optional[SoccerBetCalibrationSummaryOut] = None
+
+
+class SnapshotClosingIn(BaseModel):
+    """Body for POST /api/soccer/bets/{id}/snapshot-closing — Phase 3 CLV."""
+    closing_decimal: float = Field(gt=1.0)
+    closing_source: Optional[str] = None
+    closing_unix: Optional[int] = None
+
+
+# ----------------------------------------------------------------------
+# Phase 10 — Guardrail schemas
+# ----------------------------------------------------------------------
+
+class GuardrailCheckOut(BaseModel):
+    rule: str
+    label: str
+    passed: bool
+    severity: str
+    detail: str
+
+
+class GuardrailReportOut(BaseModel):
+    allowed: bool
+    hard_fail_count: int = 0
+    warn_count: int = 0
+    blocking_reasons: List[str] = Field(default_factory=list)
+    checks: List[GuardrailCheckOut] = Field(default_factory=list)
+
+
+class GuardrailPreviewIn(BaseModel):
+    """Body for POST /api/soccer/guardrails/preview — same shape as the
+    record-bet payload minus the qualification-snapshot stuff. Used by
+    the dashboard to render the BLOCK strip before the user submits."""
+    fixture_id: str
+    legs: List[SoccerBetLegRecord]
+    placed_decimal_odds: float = Field(gt=1.0)
+    stake_usd: float = Field(ge=0.0)
+    source: str = Field(default="manual")
+    book_decimal_odds: Optional[float] = None
+    edge: Optional[float] = None
+    same_game: bool = True
+    lineup_confirmed: bool = False
+
+
+class BetRecordBlockedOut(BaseModel):
+    """422 response body when guardrails block a bet without `force`."""
+    ok: bool = False
+    error: str = "guardrails_blocked"
+    guardrails: GuardrailReportOut
+
+
+class SoccerBetCreatedOut(BaseModel):
+    ok: bool = True
+    bet: SoccerBetOut
+    guardrails: Optional[GuardrailReportOut] = None
 
 
 class OddsLegOut(BaseModel):
@@ -1400,7 +1757,201 @@ def bet_builder(request: Request, payload: BetBuilderIn = Body(...)) -> BetBuild
             recommendation=quote.recommendation,
             recorded_unix=int(time.time()),
         )
-    return BetBuilderOut(**asdict(quote))
+
+    # Phase 9 — Smart Bet Builder & Correlation Engine
+    report = build_correlation_report(
+        sims=sims,
+        legs=legs,
+        leg_probabilities=quote.leg_probabilities,
+        joint_probability=quote.fair_probability,
+        correlation_factor=quote.correlation_factor,
+        independent_product=quote.independent_product,
+        book_decimal_odds=payload.book_decimal_odds,
+        edge=quote.edge,
+        source=payload.source,
+        lineup_confirmed=payload.lineup_confirmed,
+        same_game=payload.same_game,
+    )
+
+    out = asdict(quote)
+    out.update(
+        book_implied_probability=report.book_implied_probability,
+        correlation_tax=report.correlation_tax,
+        correlation_tax_pct=report.correlation_tax_pct,
+        parlay_rules=[asdict(r) for r in report.parlay_rules],
+        parlay_rules_passed=report.parlay_rules_passed,
+        parlay_rules_hard_fail=report.parlay_rules_hard_fail,
+        failure_modes=[asdict(m) for m in report.failure_modes],
+        leg_failure_rates=report.leg_failure_rates,
+        duplicate_exposure_groups=report.duplicate_exposure_groups,
+    )
+    return BetBuilderOut(**out)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Bet365 paste workflow
+# ---------------------------------------------------------------------------
+
+
+def _parsed_slip_to_out(slip: ParsedBet365Slip) -> ParsedBet365SlipOut:
+    return ParsedBet365SlipOut(
+        legs=[
+            ParsedBet365LegOut(
+                selection=leg.selection,
+                market=leg.market,
+                decimal_odds=leg.decimal_odds,
+                kind=leg.kind,
+                params=dict(leg.params),
+                team_hint=leg.team_hint,
+                player_hint=leg.player_hint,
+                line_hint=leg.line_hint,
+                side_hint=leg.side_hint,
+                raw_lines=list(leg.raw_lines),
+            )
+            for leg in slip.legs
+        ],
+        combined_decimal_odds=slip.combined_decimal_odds,
+        stake=slip.stake,
+        returns=slip.returns,
+        slip_type=slip.slip_type,
+        unrecognised_lines=list(slip.unrecognised_lines),
+        notes=list(slip.notes),
+    )
+
+
+@router.post("/soccer/paste/bet365", response_model=Bet365PasteOut)
+def paste_bet365(request: Request, payload: Bet365PasteIn = Body(...)) -> Bet365PasteOut:
+    """Parse a Bet365 slip pasted as text, match it against the supplied
+    model legs (if any), and reprice the matched parlay through the bet
+    builder + correlation engine.
+
+    The route works without an initialised engine for the parse-only mode
+    (no fixture_id / no model_legs) so the user can paste a slip from a
+    browser tab where they have not yet seeded data — they will just get
+    back the structured leg list with no reprice.
+    """
+    parsed = parse_bet365_slip(payload.slip_text or "")
+    out = Bet365PasteOut(parsed=_parsed_slip_to_out(parsed))
+
+    # ---- match parsed vs model legs -------------------------------------
+    model_legs_payload: List[Dict[str, object]] = []
+    for leg in payload.model_legs:
+        model_legs_payload.append({
+            "kind": leg.kind,
+            "label": leg.label or leg.kind,
+            "params": dict(leg.params or {}),
+            "book_decimal_odds": leg.book_decimal_odds,
+        })
+    out.model_legs_count = len(model_legs_payload)
+
+    matched_legs_for_reprice: List[BetLeg] = []
+    if model_legs_payload:
+        match_result = match_parsed_slip(parsed, model_legs_payload)
+        out.matches = [
+            LegMatchOut(
+                parsed_index=m.parsed_index,
+                matched_model_index=m.matched_model_index,
+                confidence=m.confidence,
+                reason=m.reason,
+                issues=list(m.issues),
+            )
+            for m in match_result.matches
+        ]
+        out.unmatched_parsed_legs = list(match_result.unmatched_parsed_legs)
+        out.unmatched_model_legs = list(match_result.unmatched_model_legs)
+        out.overall_match_confidence = match_result.overall_confidence
+        out.matched_legs_count = sum(
+            1 for m in match_result.matches if m.matched_model_index is not None
+        )
+        # Build the list of model legs in pasted-slip order for repricing.
+        for m in match_result.matches:
+            if m.matched_model_index is None:
+                continue
+            ml = payload.model_legs[m.matched_model_index]
+            matched_legs_for_reprice.append(
+                BetLeg(
+                    kind=ml.kind,
+                    params=dict(ml.params or {}),
+                    book_decimal_odds=ml.book_decimal_odds,
+                    label=ml.label,
+                )
+            )
+
+    # ---- Gate the slip before repricing --------------------------------
+    gate_blockers: List[str] = []
+    if model_legs_payload:
+        if out.unmatched_parsed_legs:
+            gate_blockers.append(
+                f"{len(out.unmatched_parsed_legs)} pasted leg(s) had no model match."
+            )
+        if out.unmatched_model_legs and out.matched_legs_count != len(model_legs_payload):
+            gate_blockers.append(
+                f"{len(out.unmatched_model_legs)} model leg(s) had no pasted match."
+            )
+        if not matched_legs_for_reprice:
+            gate_blockers.append("No legs matched; refusing to reprice an empty parlay.")
+    if any(leg.decimal_odds is None for leg in parsed.legs):
+        gate_blockers.append("One or more pasted legs are missing decimal odds.")
+    out.gate_blocking_issues = gate_blockers
+
+    # ---- Reprice ---------------------------------------------------------
+    if not payload.fixture_id or not matched_legs_for_reprice:
+        return out
+
+    eng = _engine(request)
+    eng.ensure_ready_from_store()
+    if not eng.is_ready():
+        out.reprice_error = "engine_not_initialized"
+        return out
+    rows = eng.store.fixtures_upcoming(0, limit=1000)
+    fixture = next((r for r in rows if r["id"] == payload.fixture_id), None)
+    if fixture is None:
+        out.reprice_error = "fixture_not_found"
+        return out
+    sims = eng.simulator().simulate(
+        fixture["home_team_id"], fixture["away_team_id"],
+        neutral_venue=bool(fixture["neutral_venue"]),
+        config=SimulationConfig(
+            n_sims=int(payload.n_sims),
+            seed=hash((payload.fixture_id, payload.n_sims, "paste")) & 0xFFFFFFFF,
+        ),
+    )
+    combined = parsed.combined_decimal_odds
+    quote = price_bet_builder(
+        sims, matched_legs_for_reprice,
+        book_decimal_odds=combined,
+        min_edge=settings.soccer_min_edge,
+        max_kelly=settings.soccer_kelly_cap,
+    )
+    report = build_correlation_report(
+        sims=sims,
+        legs=matched_legs_for_reprice,
+        leg_probabilities=quote.leg_probabilities,
+        joint_probability=quote.fair_probability,
+        correlation_factor=quote.correlation_factor,
+        independent_product=quote.independent_product,
+        book_decimal_odds=combined,
+        edge=quote.edge,
+        source="pasted",
+        lineup_confirmed=payload.lineup_confirmed,
+        same_game=payload.same_game,
+    )
+    reprice = asdict(quote)
+    reprice.update(
+        book_implied_probability=report.book_implied_probability,
+        correlation_tax=report.correlation_tax,
+        correlation_tax_pct=report.correlation_tax_pct,
+        parlay_rules=[asdict(r) for r in report.parlay_rules],
+        parlay_rules_passed=report.parlay_rules_passed,
+        parlay_rules_hard_fail=report.parlay_rules_hard_fail,
+        failure_modes=[asdict(m) for m in report.failure_modes],
+        leg_failure_rates=report.leg_failure_rates,
+        duplicate_exposure_groups=report.duplicate_exposure_groups,
+    )
+    out.reprice = BetBuilderOut(**reprice)
+    out.matched_fixture_id = payload.fixture_id
+    out.matched_slip_id = payload.slip_id
+    return out
 
 
 @router.get("/soccer/odds/{fixture_id}", response_model=OddsForFixtureOut)
@@ -1517,6 +2068,545 @@ def record_prediction(
     return {"ok": True, "prediction_id": pid}
 
 
+# ----------------------------------------------------------------------
+# Soccer Bet Journal — Phase 2
+# ----------------------------------------------------------------------
+
+def _bet_row_to_out(row: Dict[str, object]) -> SoccerBetOut:
+    """Materialise a SoccerBetOut from a SoccerStore row, expanding the
+    JSON-encoded legs and qualification snapshot."""
+    try:
+        legs = json.loads(row.get("legs_json") or "[]")
+        if not isinstance(legs, list):
+            legs = []
+    except (TypeError, ValueError):
+        legs = []
+    checks_json = row.get("qualification_checks_json")
+    checks: Optional[List[Dict[str, object]]]
+    if checks_json:
+        try:
+            parsed = json.loads(checks_json)
+            checks = parsed if isinstance(parsed, list) else None
+        except (TypeError, ValueError):
+            checks = None
+    else:
+        checks = None
+    return SoccerBetOut(
+        id=int(row["id"]),
+        slip_id=row.get("slip_id"),
+        fixture_id=str(row["fixture_id"]),
+        match_label=row.get("match_label"),
+        slip_type=row.get("slip_type"),
+        title=row.get("title"),
+        legs=legs,
+        model_probability=float(row["model_probability"]),
+        fair_decimal_odds=float(row["fair_decimal_odds"]),
+        placed_decimal_odds=float(row["placed_decimal_odds"]),
+        stake_usd=float(row["stake_usd"]),
+        expected_value_usd=row.get("expected_value_usd"),
+        edge=row.get("edge"),
+        kelly_fraction=row.get("kelly_fraction"),
+        qualification_status=str(row.get("qualification_status") or ""),
+        qualification_checks=checks,
+        source=str(row.get("source") or "manual"),
+        bookmaker=row.get("bookmaker"),
+        notes=row.get("notes"),
+        status=str(row.get("status") or "open"),
+        created_unix=int(row["created_unix"]),
+        placed_unix=int(row["placed_unix"]),
+        settled_unix=row.get("settled_unix"),
+        pnl_usd=row.get("pnl_usd"),
+        actual_return_usd=row.get("actual_return_usd"),
+        closing_decimal=row.get("closing_decimal"),
+        closing_source=row.get("closing_source"),
+        closing_unix=row.get("closing_unix"),
+        clv_pct=row.get("clv_pct"),
+    )
+
+
+def _clv_summary_out(d: Mapping[str, object]) -> SoccerBetClvSummaryOut:
+    """Convert the store's CLV-summary dict into the response schema."""
+    overall = d.get("overall") or {}
+    if not isinstance(overall, Mapping):
+        overall = {}
+
+    def _bucket_list(key: str) -> List[SoccerBetClvBucketOut]:
+        items = d.get(key) or []
+        if not isinstance(items, list):
+            return []
+        out: List[SoccerBetClvBucketOut] = []
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            out.append(SoccerBetClvBucketOut(
+                bucket=str(item.get("bucket") or "unknown"),
+                count=int(item.get("count") or 0),
+                count_with_clv=int(item.get("count_with_clv") or 0),
+                avg_clv_pct=item.get("avg_clv_pct"),
+                positive_clv_share=item.get("positive_clv_share"),
+                net_pnl_usd=float(item.get("net_pnl_usd") or 0.0),
+            ))
+        return out
+
+    return SoccerBetClvSummaryOut(
+        overall=SoccerBetClvOverallOut(
+            count=int(overall.get("count") or 0),
+            count_with_clv=int(overall.get("count_with_clv") or 0),
+            avg_clv_pct=overall.get("avg_clv_pct"),
+            positive_clv_share=overall.get("positive_clv_share"),
+            net_pnl_usd=float(overall.get("net_pnl_usd") or 0.0),
+        ),
+        by_market=_bucket_list("by_market"),
+        by_slip_type=_bucket_list("by_slip_type"),
+        by_source=_bucket_list("by_source"),
+        by_rating_bucket=_bucket_list("by_rating_bucket"),
+    )
+
+
+def _calibration_overall_from(d: Mapping[str, object]) -> SoccerBetCalibrationOverallOut:
+    return SoccerBetCalibrationOverallOut(
+        count=int(d.get("count") or 0),
+        won=int(d.get("won") or 0),
+        hit_rate=d.get("hit_rate"),  # type: ignore[arg-type]
+        avg_predicted=d.get("avg_predicted"),  # type: ignore[arg-type]
+        brier=d.get("brier"),  # type: ignore[arg-type]
+        log_loss=d.get("log_loss"),  # type: ignore[arg-type]
+        ev_per_dollar=d.get("ev_per_dollar"),  # type: ignore[arg-type]
+        total_stake_usd=float(d.get("total_stake_usd") or 0.0),
+        net_pnl_usd=float(d.get("net_pnl_usd") or 0.0),
+        roi=d.get("roi"),  # type: ignore[arg-type]
+    )
+
+
+def _calibration_summary_out(d: Mapping[str, object]) -> SoccerBetCalibrationSummaryOut:
+    """Convert the store's calibration-summary dict into the response schema."""
+    overall = d.get("overall") or {}
+    if not isinstance(overall, Mapping):
+        overall = {}
+
+    def _bucket_list(key: str) -> List[SoccerBetCalibrationBucketOut]:
+        items = d.get(key) or []
+        if not isinstance(items, list):
+            return []
+        out: List[SoccerBetCalibrationBucketOut] = []
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            base = _calibration_overall_from(item)
+            out.append(SoccerBetCalibrationBucketOut(
+                bucket=str(item.get("bucket") or "unknown"),
+                **base.model_dump(),
+            ))
+        return out
+
+    curve_in = d.get("reliability_curve") or []
+    curve: List[SoccerBetCalibrationCurvePointOut] = []
+    if isinstance(curve_in, list):
+        for p in curve_in:
+            if not isinstance(p, Mapping):
+                continue
+            curve.append(SoccerBetCalibrationCurvePointOut(
+                bucket=str(p.get("bucket") or "unknown"),
+                p_lo=float(p.get("p_lo") or 0.0),
+                p_hi=float(p.get("p_hi") or 0.0),
+                count=int(p.get("count") or 0),
+                avg_predicted=p.get("avg_predicted"),  # type: ignore[arg-type]
+                observed_hit_rate=p.get("observed_hit_rate"),  # type: ignore[arg-type]
+                gap=p.get("gap"),  # type: ignore[arg-type]
+            ))
+
+    return SoccerBetCalibrationSummaryOut(
+        overall=_calibration_overall_from(overall),
+        by_market=_bucket_list("by_market"),
+        by_rating_bucket=_bucket_list("by_rating_bucket"),
+        by_odds_bucket=_bucket_list("by_odds_bucket"),
+        by_slip_type=_bucket_list("by_slip_type"),
+        by_qualification_status=_bucket_list("by_qualification_status"),
+        reliability_curve=curve,
+    )
+
+
+def _grade_open_bet_legs(
+    legs: List[Dict[str, object]], hg: int, ag: int
+) -> Optional[int]:
+    """Return 1 (won), 0 (lost), or None (any leg ungradable from the
+    score alone — leave the bet open until manual settlement)."""
+    if not legs:
+        return None
+    leg_outcomes = [_resolve_leg(l, hg, ag) for l in legs]
+    if any(o is None for o in leg_outcomes):
+        return None
+    return 1 if all(o == 1 for o in leg_outcomes) else 0
+
+
+# ----------------------------------------------------------------------
+# Phase 10 — Guardrail helpers
+# ----------------------------------------------------------------------
+
+def _bet_legs_to_dataclass(
+    legs: Sequence[SoccerBetLegRecord],
+) -> List[BetLeg]:
+    """Convert the Pydantic leg shape into the dataclass BetLeg the
+    risk/correlation engines expect."""
+    out: List[BetLeg] = []
+    for leg in legs:
+        out.append(BetLeg(
+            kind=leg.kind,
+            params=dict(leg.params or {}),
+            label=leg.label,
+        ))
+    return out
+
+
+def _guardrail_report_to_out(report: GuardrailReport) -> GuardrailReportOut:
+    return GuardrailReportOut(
+        allowed=report.allowed,
+        hard_fail_count=report.hard_fail_count,
+        warn_count=report.warn_count,
+        blocking_reasons=list(report.blocking_reasons),
+        checks=[
+            GuardrailCheckOut(
+                rule=c.rule, label=c.label, passed=c.passed,
+                severity=c.severity, detail=c.detail,
+            )
+            for c in report.checks
+        ],
+    )
+
+
+def _run_guardrails(
+    *,
+    store: SoccerStore,
+    fixture_id: str,
+    legs: Sequence[SoccerBetLegRecord],
+    placed_decimal_odds: float,
+    stake_usd: float,
+    source: str,
+    book_decimal_odds: Optional[float],
+    edge: Optional[float],
+    same_game: bool,
+    lineup_confirmed: bool,
+) -> GuardrailReport:
+    """Shared entry point used by /soccer/bets and /soccer/guardrails/preview."""
+    open_by_fixture = store.soccer_bets_open_stake_by_fixture()
+    clv_summary = store.soccer_bets_clv_summary()
+    return evaluate_guardrails(
+        fixture_id=fixture_id,
+        legs=_bet_legs_to_dataclass(legs),
+        placed_decimal_odds=float(placed_decimal_odds),
+        stake_usd=float(stake_usd),
+        source=source,
+        book_decimal_odds=book_decimal_odds,
+        edge=edge,
+        same_game=same_game,
+        lineup_confirmed=lineup_confirmed,
+        open_exposure_by_fixture=open_by_fixture,
+        clv_summary=clv_summary,
+        config=GuardrailConfig(),
+    )
+
+
+def _merge_qualification_checks(
+    existing: Optional[Sequence[SoccerBetQualificationCheck]],
+    report: GuardrailReport,
+) -> Optional[List[Dict[str, object]]]:
+    """Merge the client-side qualification snapshot with the server-side
+    guardrail checks so both end up persisted on the bet row. The store
+    serialises this list verbatim into qualification_checks_json."""
+    merged: List[Dict[str, object]] = []
+    for c in existing or []:
+        merged.append(c.model_dump(by_alias=True))
+    for chk in report.checks:
+        merged.append({
+            "label": chk.label,
+            "pass": chk.passed,
+            "detail": chk.detail,
+            "severity": chk.severity,
+            "rule": chk.rule,
+            "source": "guardrail",
+        })
+    return merged or None
+
+
+@router.post("/soccer/guardrails/preview", response_model=GuardrailReportOut)
+def soccer_guardrails_preview(
+    request: Request,
+    payload: GuardrailPreviewIn,
+) -> GuardrailReportOut:
+    """Phase 10 — run the guardrail engine against a candidate bet
+    without persisting anything. The dashboard calls this just before
+    RECORD BET to show the red BLOCK strip (or green ALLOWED state)."""
+    eng = _engine(request)
+    if not payload.legs:
+        raise HTTPException(status_code=400, detail="legs must be non-empty")
+    source = (payload.source or "manual").lower().strip()
+    if source not in {"live", "pasted", "manual"}:
+        raise HTTPException(status_code=400, detail=f"unknown source: {source!r}")
+    report = _run_guardrails(
+        store=eng.store,
+        fixture_id=payload.fixture_id,
+        legs=payload.legs,
+        placed_decimal_odds=payload.placed_decimal_odds,
+        stake_usd=payload.stake_usd,
+        source=source,
+        book_decimal_odds=payload.book_decimal_odds,
+        edge=payload.edge,
+        same_game=payload.same_game,
+        lineup_confirmed=payload.lineup_confirmed,
+    )
+    return _guardrail_report_to_out(report)
+
+
+@router.post("/soccer/bets", response_model=SoccerBetCreatedOut)
+def record_soccer_bet(
+    request: Request,
+    payload: RecordSoccerBetIn,
+) -> SoccerBetCreatedOut:
+    """Persist a placed soccer bet to the journal.
+
+    Hard requirement: the qualification_status must indicate the user
+    actually cleared the gate. We accept BETTABLE unconditionally and
+    REVIEW with a non-empty `notes` (the frontend prompts the user to
+    confirm REVIEW bets). Anything else is rejected so the journal stays
+    a record of bets the gate let through, not arbitrary data.
+
+    Phase 10: server-side guardrails run independently of the client's
+    qualification snapshot. Any hard fail returns 422 with a structured
+    GuardrailReport unless the caller passed `force=true` (in which case
+    the failing checks are persisted alongside the bet but not blocking)."""
+    eng = _engine(request)
+    qstatus = payload.qualification_status.upper().strip()
+    if qstatus not in {"BETTABLE", "REVIEW"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"qualification_status must be BETTABLE or REVIEW, got {qstatus!r}",
+        )
+    if qstatus == "REVIEW" and not (payload.notes and payload.notes.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail="REVIEW bets require a notes field acknowledging the warning",
+        )
+    source = (payload.source or "manual").lower().strip()
+    if source not in {"live", "pasted", "manual"}:
+        raise HTTPException(status_code=400, detail=f"unknown source: {source!r}")
+
+    legs = [leg.model_dump() for leg in payload.legs]
+    if not legs:
+        raise HTTPException(status_code=400, detail="legs must be non-empty")
+
+    report = _run_guardrails(
+        store=eng.store,
+        fixture_id=payload.fixture_id,
+        legs=payload.legs,
+        placed_decimal_odds=payload.placed_decimal_odds,
+        stake_usd=payload.stake_usd,
+        source=source,
+        book_decimal_odds=payload.book_decimal_odds,
+        edge=payload.edge,
+        same_game=payload.same_game,
+        lineup_confirmed=payload.lineup_confirmed,
+    )
+    if not report.allowed and not payload.force:
+        return JSONResponse(
+            status_code=422,
+            content=BetRecordBlockedOut(
+                guardrails=_guardrail_report_to_out(report),
+            ).model_dump(),
+        )
+
+    merged_checks = _merge_qualification_checks(payload.qualification_checks, report)
+
+    now = int(time.time())
+    try:
+        bid = eng.store.record_soccer_bet(
+            slip_id=payload.slip_id,
+            fixture_id=payload.fixture_id,
+            match_label=payload.match_label,
+            slip_type=payload.slip_type,
+            title=payload.title,
+            legs=legs,
+            model_probability=float(payload.model_probability),
+            fair_decimal_odds=float(payload.fair_decimal_odds),
+            placed_decimal_odds=float(payload.placed_decimal_odds),
+            stake_usd=float(payload.stake_usd),
+            expected_value_usd=payload.expected_value_usd,
+            edge=payload.edge,
+            kelly_fraction=payload.kelly_fraction,
+            qualification_status=qstatus,
+            qualification_checks=merged_checks,
+            source=source,
+            bookmaker=payload.bookmaker,
+            notes=payload.notes,
+            created_unix=now,
+            placed_unix=now,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    row = eng.store.soccer_bet_get(bid)
+    if row is None:
+        raise HTTPException(status_code=500, detail="bet_record_lookup_failed")
+    return SoccerBetCreatedOut(
+        ok=True,
+        bet=_bet_row_to_out(row),
+        guardrails=_guardrail_report_to_out(report),
+    )
+
+
+@router.get("/soccer/bets", response_model=SoccerBetListOut)
+def list_soccer_bets(
+    request: Request,
+    status: Optional[str] = None,
+    fixture_id: Optional[str] = None,
+    since_unix: Optional[int] = None,
+    limit: int = 200,
+) -> SoccerBetListOut:
+    """List soccer bets ordered most-recent-placed-first plus aggregate
+    open exposure / settled summary so the journal can render its header
+    in one round-trip."""
+    eng = _engine(request)
+    rows = eng.store.soccer_bets_list(
+        status=status, fixture_id=fixture_id, since_unix=since_unix, limit=limit,
+    )
+    bets = [_bet_row_to_out(r) for r in rows]
+    exposure_dict = eng.store.soccer_bets_open_exposure()
+    settled_dict = eng.store.soccer_bets_settled_summary()
+    exposure = SoccerBetExposureOut(
+        open_count=int(exposure_dict["open_count"]),
+        open_stake_usd=float(exposure_dict["open_stake_usd"]),
+        open_max_return_usd=float(exposure_dict["open_max_return_usd"]),
+        by_match=[
+            SoccerBetMatchExposureOut(
+                match_label=str(r["match_label"]),
+                n=int(r["n"]),
+                stake_usd=float(r["stake_usd"]),
+                max_return_usd=float(r["max_return_usd"]),
+            )
+            for r in exposure_dict["by_match"]
+        ],
+    )
+    settled = SoccerBetSettledSummaryOut(**settled_dict)
+    clv_summary = _clv_summary_out(eng.store.soccer_bets_clv_summary())
+    calibration_summary = _calibration_summary_out(
+        eng.store.soccer_bets_calibration_summary()
+    )
+    return SoccerBetListOut(
+        bets=bets, exposure=exposure, settled=settled,
+        clv_summary=clv_summary, calibration_summary=calibration_summary,
+    )
+
+
+@router.get("/soccer/bets/clv-summary", response_model=SoccerBetClvSummaryOut)
+def soccer_bets_clv_summary(request: Request) -> SoccerBetClvSummaryOut:
+    """Standalone CLV aggregate. Mirrors `clv_summary` on `/soccer/bets`
+    so the CLV panel can refresh independently of the bet list."""
+    eng = _engine(request)
+    return _clv_summary_out(eng.store.soccer_bets_clv_summary())
+
+
+@router.get(
+    "/soccer/bets/calibration-summary",
+    response_model=SoccerBetCalibrationSummaryOut,
+)
+def soccer_bets_calibration_summary(request: Request) -> SoccerBetCalibrationSummaryOut:
+    """Phase 4 — model calibration aggregate. Filters to settled won/lost
+    bets and reports Brier/log-loss/hit-rate/EV/PnL by market, rating,
+    odds, slip type, and qualification status, plus a 10-bucket
+    reliability curve so the journal can flag broken markets."""
+    eng = _engine(request)
+    return _calibration_summary_out(eng.store.soccer_bets_calibration_summary())
+
+
+@router.post(
+    "/soccer/bets/{bet_id}/snapshot-closing",
+    response_model=SoccerBetOut,
+)
+def snapshot_soccer_bet_closing(
+    request: Request,
+    bet_id: int,
+    payload: SnapshotClosingIn,
+) -> SoccerBetOut:
+    """Snapshot the closing decimal odds for a bet. The store auto-fills
+    clv_pct from placed vs closing implied probability. Used by the
+    journal `SNAPSHOT CLOSE` row action and (eventually) by the
+    pre-kickoff resolution loop."""
+    eng = _engine(request)
+    existing = eng.store.soccer_bet_get(bet_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="bet_not_found")
+    closing_unix = payload.closing_unix
+    if closing_unix is None:
+        closing_unix = int(time.time())
+    try:
+        updated = eng.store.soccer_bet_update(
+            int(bet_id),
+            closing_decimal=float(payload.closing_decimal),
+            closing_source=payload.closing_source,
+            closing_unix=int(closing_unix),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if updated is None:
+        raise HTTPException(status_code=404, detail="bet_not_found")
+    return _bet_row_to_out(updated)
+
+
+@router.patch("/soccer/bets/{bet_id}", response_model=SoccerBetOut)
+def update_soccer_bet(
+    request: Request,
+    bet_id: int,
+    payload: UpdateSoccerBetIn,
+) -> SoccerBetOut:
+    eng = _engine(request)
+    existing = eng.store.soccer_bet_get(bet_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="bet_not_found")
+    # When the caller marks the bet won/lost without supplying pnl_usd,
+    # auto-compute it from the placed odds + stake. The user can override
+    # later by PATCHing pnl_usd directly.
+    pnl_usd = payload.pnl_usd
+    actual_return = payload.actual_return_usd
+    if pnl_usd is None and payload.status in {"won", "lost", "pushed"}:
+        try:
+            stake = float(existing["stake_usd"])
+            odds = float(existing["placed_decimal_odds"])
+        except (TypeError, ValueError):
+            stake = 0.0
+            odds = 1.0
+        if payload.status == "won":
+            pnl_usd = stake * (odds - 1.0)
+        elif payload.status == "lost":
+            pnl_usd = -stake
+        else:  # pushed
+            pnl_usd = 0.0
+    # `cashed_out` PnL is always user-supplied (or computed from
+    # actual_return_usd if available).
+    if pnl_usd is None and payload.status == "cashed_out" and actual_return is not None:
+        try:
+            stake = float(existing["stake_usd"])
+        except (TypeError, ValueError):
+            stake = 0.0
+        pnl_usd = float(actual_return) - stake
+    try:
+        updated = eng.store.soccer_bet_update(
+            int(bet_id),
+            status=payload.status,
+            placed_decimal_odds=payload.placed_decimal_odds,
+            notes=payload.notes,
+            pnl_usd=pnl_usd,
+            actual_return_usd=payload.actual_return_usd,
+            settled_unix=payload.settled_unix,
+            closing_decimal=payload.closing_decimal,
+            closing_source=payload.closing_source,
+            closing_unix=payload.closing_unix,
+            clv_pct=payload.clv_pct,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if updated is None:
+        raise HTTPException(status_code=404, detail="bet_not_found")
+    return _bet_row_to_out(updated)
+
+
 @router.post("/soccer/fixtures/{fixture_id}/resolve", response_model=ResolveResultOut)
 def resolve_fixture(
     request: Request,
@@ -1589,6 +2679,42 @@ def resolve_fixture(
         )
         bb_graded += 1
 
+    # Phase 2: auto-grade open soccer_bets whose legs are score-derivable.
+    # Bets with a leg the resolver can't handle (player props, cards,
+    # corners…) stay open for manual settlement until Phase 4 ships a
+    # stats feed.
+    bets_graded = 0
+    bets_skipped = 0
+    for row in eng.store.soccer_bets_for_fixture(fixture_id, only_open=True):
+        try:
+            legs = json.loads(row.get("legs_json") or "[]")
+        except (TypeError, ValueError):
+            legs = []
+        outcome = _grade_open_bet_legs(legs, hg, ag)
+        if outcome is None:
+            bets_skipped += 1
+            continue
+        try:
+            stake = float(row.get("stake_usd") or 0.0)
+            odds = float(row.get("placed_decimal_odds") or 1.0)
+        except (TypeError, ValueError):
+            stake = 0.0
+            odds = 1.0
+        new_status = "won" if outcome == 1 else "lost"
+        pnl = stake * (odds - 1.0) if outcome == 1 else -stake
+        try:
+            eng.store.soccer_bet_update(
+                int(row["id"]),
+                status=new_status,
+                pnl_usd=pnl,
+                settled_unix=int(time.time()),
+            )
+            bets_graded += 1
+        except ValueError:
+            # Race: somebody settled the bet between SELECT and UPDATE.
+            # Don't fail the whole resolution loop over it.
+            bets_skipped += 1
+
     eng.store.fixture_set_status(fixture_id, "CLOSED")
     cal_n = eng.refit_calibration()
 
@@ -1600,6 +2726,8 @@ def resolve_fixture(
         bet_builder_graded=bb_graded,
         skipped_unsupported_market=skipped,
         calibration_records=cal_n,
+        soccer_bets_graded=bets_graded,
+        soccer_bets_skipped=bets_skipped,
     )
 
 
