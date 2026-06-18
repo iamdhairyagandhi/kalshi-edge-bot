@@ -21,7 +21,7 @@ import logging
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import httpx
@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 
 from src.config import settings
 from src.sports.soccer.calibration.isotonic import (
+    CalibrationLayer,
     PredictionRecord,
     brier_score,
     reliability_buckets,
@@ -41,6 +42,7 @@ from src.sports.soccer.models.cards import CardsModel
 from src.sports.soccer.models.dixon_coles import DixonColesModel
 from src.sports.soccer.models.minutes import MinutesModel
 from src.sports.soccer.models.player_share import PlayerShareModel
+from src.sports.soccer.models.xg import XgModel, aggregate_match_xg
 from src.sports.soccer.pricing.edge import report_edge
 from src.sports.soccer.ratings.elo import EloTable
 from src.sports.soccer.simulator.bet_builder import price_bet_builder
@@ -141,6 +143,36 @@ class CalibrationOut(BaseModel):
     reliability: List[Dict[str, float]]
 
 
+class RecordPredictionIn(BaseModel):
+    """Body for POST /api/soccer/predictions — let the user log a bet
+    they actually took so we can grade it later for calibration + CLV."""
+    fixture_id: str
+    market_type: str  # e.g. "home_win" / "over_2_5" / "btts_yes"
+    leg: Dict[str, object]  # canonical BetLeg dict
+    fair_probability: float
+    fair_decimal_odds: float
+    book_decimal_odds: Optional[float] = None
+    pinnacle_close_decimal: Optional[float] = None
+    edge: Optional[float] = None
+    kelly_fraction: Optional[float] = None
+    recommendation: str = "manual_record"
+
+
+class ResolveFixtureIn(BaseModel):
+    home_goals: int
+    away_goals: int
+
+
+class ResolveResultOut(BaseModel):
+    fixture_id: str
+    home_goals: int
+    away_goals: int
+    predictions_graded: int
+    bet_builder_graded: int
+    skipped_unsupported_market: int
+    calibration_records: int
+
+
 class OddsLegOut(BaseModel):
     market_key: str
     selection: str
@@ -175,6 +207,8 @@ class SoccerMarketEdgeOut(BaseModel):
     recommendation: str
     book_count: int = 0
     prices: List[SoccerBookPriceOut] = Field(default_factory=list)
+    no_vig_market_prob: Optional[float] = None
+    edge_vs_market: Optional[float] = None
 
 
 class SoccerParlayBlueprintOut(BaseModel):
@@ -232,6 +266,11 @@ class SoccerBetslipOut(BaseModel):
     confidence: float = 0.0
     reasons: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
+    # scout_only=True means we have a model price but NO confirmed book
+    # quote (e.g., corners/cards markets the Odds API free tier omits).
+    # The UI should render these without a stake button and label them
+    # "SCOUT" so the user knows to manually confirm a price before betting.
+    scout_only: bool = False
 
 
 class SoccerBetslipBatchOut(BaseModel):
@@ -252,6 +291,12 @@ class StatsBombCompetitionIn(BaseModel):
 class FitFromStatsBombIn(BaseModel):
     competitions: Optional[List[StatsBombCompetitionIn]] = None
     decay_per_day: Optional[float] = None
+
+
+class FitXgFromStatsBombIn(BaseModel):
+    competitions: Optional[List[StatsBombCompetitionIn]] = None
+    decay_per_day: Optional[float] = None
+    match_limit_per_comp: Optional[int] = None
 
 
 class OddsFixtureIngestOut(BaseModel):
@@ -291,10 +336,57 @@ class SoccerEngine:
         self.player_names: Dict[str, str] = {}
         self.fitted_at_unix: Optional[int] = None
         self.fit_source: str = "uninitialized"
+        # Per-market isotonic calibration. Identity by default; fit from
+        # resolved predictions whenever the model is (re)fit, and again
+        # after the resolution loop writes new outcomes.
+        self.calibration = CalibrationLayer()
+        self.calibration_fitted_at_unix: Optional[int] = None
+        # Shot-level xG model. When fitted, per-match xG totals replace
+        # raw historical goal counts as the Dixon-Coles fit target.
+        self.xg_model: Optional[XgModel] = None
+        self.xg_fitted_at_unix: Optional[int] = None
+        self.xg_match_count: int = 0
+        self.xg_shot_count: int = 0
+        self.use_xg_targets: bool = True
 
     # --------------------------------------------------------------
     def is_ready(self) -> bool:
         return self.score_model is not None and len(self.squads) > 0
+
+    # --------------------------------------------------------------
+    def _apply_xg_targets(
+        self,
+        matches: List[Dict[str, object]],
+    ) -> Tuple[List[Dict[str, object]], int]:
+        """Return a copy of `matches` where `home_goals`/`away_goals` are
+        replaced with `round(home_xg/away_xg)` for rows that carry xG
+        columns. Used as the lower-variance DC fit target.
+
+        Returns `(matches_out, n_replaced)`. When xG targeting is disabled
+        (`self.use_xg_targets = False`) the input is returned unchanged.
+        """
+        if not self.use_xg_targets:
+            return matches, 0
+        out: List[Dict[str, object]] = []
+        n_replaced = 0
+        for m in matches:
+            hxg = m.get("home_xg")
+            axg = m.get("away_xg")
+            if hxg is not None and axg is not None:
+                try:
+                    hxg_f = float(hxg)
+                    axg_f = float(axg)
+                except (TypeError, ValueError):
+                    out.append(m)
+                    continue
+                copy = dict(m)
+                copy["home_goals"] = int(round(hxg_f))
+                copy["away_goals"] = int(round(axg_f))
+                out.append(copy)
+                n_replaced += 1
+            else:
+                out.append(m)
+        return out, n_replaced
 
     # --------------------------------------------------------------
     def ensure_ready_from_store(self) -> bool:
@@ -314,6 +406,7 @@ class SoccerEngine:
         self._fit_models(matches, team_lookup, decay_per_day=settings.soccer_decay_per_day)
         self.fitted_at_unix = int(time.time())
         self.fit_source = "store"
+        self.refit_calibration()
         return True
 
     # --------------------------------------------------------------
@@ -325,9 +418,13 @@ class SoccerEngine:
         decay_per_day: float,
     ) -> None:
         self.team_names = {tid: meta["name"] for tid, meta in team_lookup.items()}
+        # Elo always fits to *actual* match outcomes (it is a result-based
+        # rating, not a strength estimator). xG only feeds Dixon-Coles.
         self.elo = EloTable()
         self.elo.fit(matches)
-        self.score_model = DixonColesModel.fit(matches, decay_per_day=decay_per_day)
+        dc_matches, n_xg_used = self._apply_xg_targets(matches)
+        self.score_model = DixonColesModel.fit(dc_matches, decay_per_day=decay_per_day)
+        self.xg_match_count = n_xg_used
 
         squads_seed: Dict[str, List[Dict[str, str]]] = {}
         for tid, meta in team_lookup.items():
@@ -353,6 +450,90 @@ class SoccerEngine:
         self.cards = CardsModel.from_priors(
             {pid: {"yellow_per90": 0.20, "red_per90": 0.005} for pid in all_pids},
         )
+
+    # --------------------------------------------------------------
+    def refit_calibration(self) -> int:
+        """Refit the per-market isotonic calibration from resolved
+        predictions in the store. Safe to call with zero records — the
+        layer simply stays identity until each market accumulates ≥30
+        resolved samples. Returns the count of resolved records read."""
+        try:
+            rows = self.store.predictions_resolved()
+        except Exception:
+            return 0
+        records: List[PredictionRecord] = []
+        for r in rows:
+            try:
+                records.append(PredictionRecord(
+                    market_type=str(r["market_type"]),
+                    fair_probability=float(r["fair_probability"]),
+                    book_decimal_odds=r.get("book_decimal_odds"),
+                    pinnacle_close_decimal=r.get("pinnacle_close_decimal"),
+                    outcome=int(r["outcome"]) if r.get("outcome") is not None else None,
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
+        self.calibration = CalibrationLayer()
+        if records:
+            try:
+                self.calibration.fit(records)
+            except Exception as exc:  # pragma: no cover
+                _LOG.warning("calibration fit failed: %s", exc)
+        self.calibration_fitted_at_unix = int(time.time())
+        return len(records)
+
+    # --------------------------------------------------------------
+    def calibrate_market(self, market_type: str, p: float) -> float:
+        """Apply the per-market isotonic calibration to a single
+        probability. Returns p unchanged if the market hasn't been
+        fitted yet (insufficient resolved samples)."""
+        try:
+            q = self.calibration.calibrate(market_type, float(p))
+        except Exception:
+            return float(p)
+        if q != q or q <= 0.0 or q >= 1.0:  # NaN guard + clip
+            return float(min(max(p, 1e-6), 1.0 - 1e-6))
+        return float(q)
+
+    # --------------------------------------------------------------
+    # Canonical market_type strings — must match what the resolution
+    # loop writes to predictions.market_type so the isotonic mapping
+    # actually applies.
+    _CALIBRATE_KEYS = (
+        "home_win", "draw", "away_win",
+        "over_2_5", "under_2_5",
+        "over_1_5", "under_1_5",
+        "over_3_5", "under_3_5",
+        "btts_yes", "btts_no",
+    )
+
+    def calibrate_probs(self, probs: Dict[str, float]) -> Dict[str, float]:
+        """Calibrate every recognised key in a probs dict and renormalise
+        complementary 2-/3-way buckets so they still sum to ~1. Unknown
+        keys are passed through untouched."""
+        if not probs:
+            return probs
+        out: Dict[str, float] = dict(probs)
+        for k in self._CALIBRATE_KEYS:
+            if k in out and out[k] is not None:
+                out[k] = self.calibrate_market(k, float(out[k]))
+        # Renormalise the canonical complementary buckets.
+        for bucket in (
+            ("home_win", "draw", "away_win"),
+            ("over_2_5", "under_2_5"),
+            ("over_1_5", "under_1_5"),
+            ("over_3_5", "under_3_5"),
+            ("btts_yes", "btts_no"),
+        ):
+            present = [k for k in bucket if k in out and out[k] is not None]
+            if len(present) < 2:
+                continue
+            s = sum(float(out[k]) for k in present)
+            if s <= 0:
+                continue
+            for k in present:
+                out[k] = float(out[k]) / s
+        return out
 
     # --------------------------------------------------------------
     def seed_demo(self) -> Dict[str, object]:
@@ -474,6 +655,7 @@ class SoccerEngine:
         self.store.upsert_fixtures(fixtures)
         self.fitted_at_unix = int(time.time())
         self.fit_source = "demo"
+        self.refit_calibration()
         return {"teams": len(self.team_names), "fixtures": len(fixtures), "matches_used": len(matches)}
 
     # --------------------------------------------------------------
@@ -532,16 +714,147 @@ class SoccerEngine:
             ))
         self.store.upsert_teams(teams_now, now_unix=int(time.time()))
 
-        self._fit_models(all_matches, team_lookup, decay_per_day=decay)
+        # Re-read from store so any previously-computed xG columns are
+        # picked up. This means a fit-statsbomb call after fit-xg will
+        # automatically use the xG-derived targets without re-running
+        # the shot model.
+        stored_matches = self.store.historical_matches()
+        merged = stored_matches if stored_matches else all_matches
+        self._fit_models(merged, team_lookup, decay_per_day=decay)
 
         self.fitted_at_unix = int(time.time())
-        self.fit_source = "statsbomb"
+        self.fit_source = "statsbomb+xg" if self.xg_match_count > 0 else "statsbomb"
         deleted_synthetic_fixtures = self.store.delete_synthetic_fixtures()
+        self.refit_calibration()
 
         return {
             "competitions": sources,
-            "matches_used": len(all_matches),
+            "matches_used": len(merged),
             "teams": len(team_lookup),
+            "decay_per_day": decay,
+            "deleted_synthetic_fixtures": deleted_synthetic_fixtures,
+            "xg_matches_applied": self.xg_match_count,
+        }
+
+    # --------------------------------------------------------------
+    def fit_xg_from_statsbomb(
+        self,
+        competitions: List[Dict[str, int]],
+        *,
+        cache_dir: Optional[str] = None,
+        decay_per_day: Optional[float] = None,
+        match_limit_per_comp: Optional[int] = None,
+    ) -> Dict[str, object]:
+        """Pull shot events for the requested competitions, train an xG
+        model on them, compute per-match home/away xG totals, persist to
+        the store, and refit Dixon-Coles using the xG-derived targets.
+
+        Each entry: {"competition_id": int, "season_id": int, "neutral": bool}.
+
+        Pulling events is expensive (one HTTP request per match, typically
+        50-200KB each). Use `match_limit_per_comp` to cap for smoke tests.
+        Subsequent calls are cheap thanks to the StatsBomb file cache.
+        """
+        cdir = cache_dir or settings.soccer_data_cache_dir
+        decay = decay_per_day if decay_per_day is not None else settings.soccer_decay_per_day
+
+        all_shots: List[Dict[str, object]] = []
+        match_home_away: Dict[str, Tuple[str, str]] = {}
+        team_lookup: Dict[str, Dict[str, str]] = {}
+        sources: List[str] = []
+        all_matches: List[Dict[str, object]] = []
+
+        with StatsBombOpenData(cache_dir=cdir) as sb:
+            for entry in competitions:
+                cid = int(entry["competition_id"])
+                sid = int(entry["season_id"])
+                neutral = bool(entry.get("neutral", True))
+                rows = sb.matches_for_dixon_coles(cid, sid, neutral_default=neutral)
+                if not rows:
+                    continue
+                sources.append(
+                    f"{cid}/{sid} ({rows[0].get('competition','?')} {rows[0].get('season','?')})"
+                )
+                if match_limit_per_comp is not None:
+                    rows = rows[:match_limit_per_comp]
+                for r in rows:
+                    all_matches.append(r)
+                    h_id = str(r["home_team_id"])
+                    a_id = str(r["away_team_id"])
+                    mid = str(r.get("match_id") or "")
+                    if mid:
+                        match_home_away[mid] = (h_id, a_id)
+                    team_lookup.setdefault(h_id, {
+                        "name": str(r.get("home_team_name") or h_id),
+                        "country": str(r.get("home_country") or ""),
+                    })
+                    team_lookup.setdefault(a_id, {
+                        "name": str(r.get("away_team_name") or a_id),
+                        "country": str(r.get("away_country") or ""),
+                    })
+                    # Pull shots for this match
+                    try:
+                        match_id_int = int(r["match_id"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    shots = sb.shots_for_match(match_id_int)
+                    all_shots.extend(shots)
+
+        if not all_matches:
+            raise RuntimeError("statsbomb returned no matches for the requested competitions")
+        if not all_shots:
+            raise RuntimeError("statsbomb returned no shot events for the requested competitions")
+
+        # Persist matches + teams so a fresh DB has the baseline rows to
+        # update xG into.
+        self.store.upsert_historical_matches(all_matches)
+        teams_now = []
+        for tid, meta in team_lookup.items():
+            teams_now.append(Team(
+                team_id=tid,
+                name=meta["name"],
+                country=meta["country"] or None,
+                elo=1500.0,
+                attack=0.0,
+                defense=0.0,
+            ))
+        self.store.upsert_teams(teams_now, now_unix=int(time.time()))
+
+        # Train the xG model on all shots.
+        self.xg_model = XgModel.fit(all_shots)
+        self.xg_shot_count = len(all_shots)
+        self.xg_fitted_at_unix = int(time.time())
+
+        # Aggregate per-match xG and persist.
+        per_match = aggregate_match_xg(
+            all_shots, self.xg_model, match_home_away=match_home_away,
+        )
+        xg_rows = [
+            {"match_id": mid, "home_xg": hxg, "away_xg": axg}
+            for mid, (hxg, axg) in per_match.items()
+        ]
+        self.store.upsert_match_xg(xg_rows)
+
+        # Re-read matches from store so DC fits on the freshly-written xG.
+        stored_matches = self.store.historical_matches()
+        merged = stored_matches if stored_matches else all_matches
+        self._fit_models(merged, team_lookup, decay_per_day=decay)
+
+        self.fitted_at_unix = int(time.time())
+        self.fit_source = "statsbomb+xg"
+        deleted_synthetic_fixtures = self.store.delete_synthetic_fixtures()
+        self.refit_calibration()
+
+        coverage = self.store.historical_matches_xg_coverage()
+
+        return {
+            "competitions": sources,
+            "matches_used": len(merged),
+            "matches_with_xg": coverage["with_xg"],
+            "xg_shots_trained": self.xg_model.n_shots_trained,
+            "xg_goals_trained": self.xg_model.n_goals_trained,
+            "xg_backend": self.xg_model.backend,
+            "xg_base_rate": round(self.xg_model.base_rate, 4),
             "decay_per_day": decay,
             "deleted_synthetic_fixtures": deleted_synthetic_fixtures,
         }
@@ -648,6 +961,37 @@ def fit_statsbomb(
     return {"ok": True, "fit_source": eng.fit_source, **info}
 
 
+@router.post("/soccer/fit-xg")
+def fit_xg(
+    request: Request,
+    body: Optional[FitXgFromStatsBombIn] = Body(default=None),
+) -> Dict[str, object]:
+    """Train the shot-level xG model on StatsBomb open-data, persist
+    per-match home/away xG totals into the store, then refit Dixon-Coles
+    using xG as the goal-rate target (lower variance than raw goal counts).
+
+    This is the P0-4 deliverable: real xG replaces actual historical
+    goals as the DC fit target. Subsequent /fit-statsbomb calls will
+    automatically pick up the persisted xG columns from the store, so
+    you only need to run /fit-xg once per dataset refresh.
+    """
+    eng = _engine(request)
+    comps: List[Dict[str, object]]
+    if body is not None and body.competitions:
+        comps = [c.model_dump() for c in body.competitions]
+    else:
+        comps = list(_DEFAULT_STATSBOMB_COMPS)
+    try:
+        info = eng.fit_xg_from_statsbomb(
+            comps,
+            decay_per_day=(body.decay_per_day if body is not None else None),
+            match_limit_per_comp=(body.match_limit_per_comp if body is not None else None),
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=f"statsbomb_fetch_failed: {e}") from e
+    return {"ok": True, "fit_source": eng.fit_source, **info}
+
+
 @router.post("/soccer/ingest-odds-fixtures", response_model=OddsFixtureIngestOut)
 def ingest_odds_fixtures(request: Request) -> Dict[str, object]:
     eng = _engine(request)
@@ -695,6 +1039,7 @@ def fixtures(request: Request, since_unix: Optional[int] = None, limit: int = 50
                     r["home_team_id"], r["away_team_id"],
                     neutral=bool(r["neutral_venue"]),
                 )
+                probs = eng.calibrate_probs(probs)
             except KeyError:
                 probs = {}
         out.append(FixtureOut(
@@ -732,6 +1077,7 @@ def match_summary(request: Request, fixture_id: str, n_sims: int = 5000) -> Matc
     assert eng.score_model is not None
     sm = eng.score_model.score_matrix(home_id, away_id, neutral=neutral, max_goals=8)
     outcome = eng.score_model.outcome_probs(home_id, away_id, neutral=neutral, max_goals=8)
+    outcome = eng.calibrate_probs(outcome)
     sim = eng.simulator()
     sims = sim.simulate(home_id, away_id, neutral_venue=neutral,
                         config=SimulationConfig(n_sims=int(n_sims), seed=hash(fixture_id) & 0xFFFFFFFF))
@@ -792,6 +1138,7 @@ def edge_board(request: Request, fixture_id: str, n_sims: int = 8000) -> SoccerE
     away = eng.team_names.get(away_id, away_id)
     assert eng.score_model is not None
     probs = eng.score_model.outcome_probs(home_id, away_id, neutral=neutral, max_goals=10)
+    probs = eng.calibrate_probs(probs)
     lam_h, lam_a = eng.score_model.params.lambdas(home_id, away_id, neutral=neutral)
 
     event: Optional[Dict[str, object]] = None
@@ -817,6 +1164,16 @@ def edge_board(request: Request, fixture_id: str, n_sims: int = 8000) -> SoccerE
         ("BTTS", "btts", "Yes", "BTTS yes", probs["btts_yes"], None),
         ("BTTS", "btts", "No", "BTTS no", probs["btts_no"], None),
     ]
+    # Pre-build de-vig vectors per market so every selection on the same
+    # market shares one consensus probability.
+    h2h_vec = _devig_vector(event, "h2h", [(home, None), ("Draw", None), (away, None)]) if event else None
+    totals_vec = _devig_vector(event, "totals", [("Over", 2.5), ("Under", 2.5)]) if event else None
+    btts_vec = _devig_vector(event, "btts", [("Yes", None), ("No", None)]) if event else None
+    market_vec_for = {
+        "h2h": h2h_vec,
+        "totals": totals_vec,
+        "btts": btts_vec,
+    }
     edges: List[SoccerMarketEdgeOut] = []
     for group, market_key, selection, label, p_model, point in specs:
         prices = _book_prices(event, market_key, selection, point=point) if event else []
@@ -828,6 +1185,7 @@ def edge_board(request: Request, fixture_id: str, n_sims: int = 8000) -> SoccerE
             min_edge=settings.soccer_min_edge,
             kelly_fraction=settings.soccer_kelly_fraction,
             kelly_cap=settings.soccer_kelly_cap,
+            market_decimal_odds=market_vec_for.get(market_key),
         )
         edges.append(SoccerMarketEdgeOut(
             market_group=group,
@@ -844,6 +1202,8 @@ def edge_board(request: Request, fixture_id: str, n_sims: int = 8000) -> SoccerE
             recommendation=rep.recommendation,
             book_count=len(prices),
             prices=[SoccerBookPriceOut(book=b, decimal=d) for b, d in sorted(prices, key=lambda x: -x[1])[:6]],
+            no_vig_market_prob=rep.no_vig_market_prob,
+            edge_vs_market=rep.edge_vs_market,
         ))
 
     sims = eng.simulator().simulate(
@@ -1093,6 +1453,170 @@ def calibration(request: Request) -> List[CalibrationOut]:
     return out
 
 
+@router.post("/soccer/predictions")
+def record_prediction(
+    request: Request,
+    payload: RecordPredictionIn,
+) -> Dict[str, object]:
+    """Persist a single pick the user actually took. Required input for
+    the resolution loop and isotonic calibration — without this we have
+    no resolved samples to fit on."""
+    eng = _engine(request)
+    pid = eng.store.record_prediction(
+        fixture_id=payload.fixture_id,
+        market_type=payload.market_type,
+        leg=payload.leg,
+        fair_probability=float(payload.fair_probability),
+        fair_decimal_odds=float(payload.fair_decimal_odds),
+        book_decimal_odds=payload.book_decimal_odds,
+        pinnacle_close_decimal=payload.pinnacle_close_decimal,
+        edge=payload.edge,
+        kelly_fraction=payload.kelly_fraction,
+        recommendation=payload.recommendation,
+        recorded_unix=int(time.time()),
+    )
+    return {"ok": True, "prediction_id": pid}
+
+
+@router.post("/soccer/fixtures/{fixture_id}/resolve", response_model=ResolveResultOut)
+def resolve_fixture(
+    request: Request,
+    fixture_id: str,
+    payload: ResolveFixtureIn,
+) -> ResolveResultOut:
+    """Mark a fixture as final with the given (home_goals, away_goals)
+    and grade every recorded prediction + bet-builder quote against it.
+
+    Markets we can score from the final score alone (1X2 / totals / BTTS
+    / team total / correct score) get an outcome of 0 or 1. Player /
+    cards / corners / shots markets need a stats feed we don't ingest
+    yet and are skipped (outcome stays NULL).
+
+    After grading we refit the calibration layer so the next probability
+    surface uses the updated isotonic mapping."""
+    eng = _engine(request)
+    fixture = eng.store.fixture_get(fixture_id)
+    if fixture is None:
+        raise HTTPException(status_code=404, detail="fixture_not_found")
+    if payload.home_goals < 0 or payload.away_goals < 0:
+        raise HTTPException(status_code=400, detail="goals_must_be_non_negative")
+
+    hg = int(payload.home_goals)
+    ag = int(payload.away_goals)
+
+    # Persist the historical match so future Dixon-Coles / Elo refits
+    # see it. (Idempotent via upsert.)
+    eng.store.upsert_historical_matches([{
+        "match_id": f"resolved-{fixture_id}",
+        "home_team_id": fixture["home_team_id"],
+        "away_team_id": fixture["away_team_id"],
+        "home_goals": hg,
+        "away_goals": ag,
+        "kickoff_unix": int(fixture.get("kickoff_unix") or time.time()),
+        "neutral_venue": bool(fixture.get("neutral_venue", False)),
+        "competition": fixture.get("competition") or "",
+    }])
+
+    pred_graded = 0
+    skipped = 0
+    for row in eng.store.predictions_for_fixture(fixture_id):
+        try:
+            leg = json.loads(row.get("leg_json") or "{}")
+        except (TypeError, ValueError):
+            leg = {}
+        outcome = _grade_market_type_from_score(
+            str(row.get("market_type") or ""), leg, hg, ag,
+        )
+        if outcome is None:
+            skipped += 1
+            continue
+        eng.store.set_prediction_outcome(int(row["id"]), int(outcome))
+        pred_graded += 1
+
+    bb_graded = 0
+    for row in eng.store.bet_builder_for_fixture(fixture_id):
+        try:
+            legs = json.loads(row.get("legs_json") or "[]")
+        except (TypeError, ValueError):
+            legs = []
+        leg_outcomes = [_resolve_leg(l, hg, ag) for l in legs]
+        if not leg_outcomes or any(o is None for o in leg_outcomes):
+            # If any leg can't be graded from the score alone, we can't
+            # grade the parlay. Skip silently.
+            continue
+        eng.store.set_bet_builder_outcome(
+            int(row["id"]),
+            1 if all(o == 1 for o in leg_outcomes) else 0,
+        )
+        bb_graded += 1
+
+    eng.store.fixture_set_status(fixture_id, "CLOSED")
+    cal_n = eng.refit_calibration()
+
+    return ResolveResultOut(
+        fixture_id=fixture_id,
+        home_goals=hg,
+        away_goals=ag,
+        predictions_graded=pred_graded,
+        bet_builder_graded=bb_graded,
+        skipped_unsupported_market=skipped,
+        calibration_records=cal_n,
+    )
+
+
+@router.post("/soccer/fixtures/{fixture_id}/snapshot-closing-line")
+def snapshot_closing_line(request: Request, fixture_id: str) -> Dict[str, object]:
+    """Snapshot Pinnacle's current h2h / totals 2.5 / BTTS prices and
+    write them onto every recorded prediction for this fixture so we
+    can compute CLV after settlement. Call this within a couple of
+    minutes of kickoff for the cleanest CLV signal."""
+    eng = _engine(request)
+    if not settings.odds_api_key:
+        raise HTTPException(status_code=409, detail="odds_api_key_not_configured")
+    fixture = eng.store.fixture_get(fixture_id)
+    if fixture is None:
+        raise HTTPException(status_code=404, detail="fixture_not_found")
+    home = eng.team_names.get(fixture["home_team_id"], fixture["home_team_id"])
+    away = eng.team_names.get(fixture["away_team_id"], fixture["away_team_id"])
+    try:
+        with OddsApiClient(api_key=settings.odds_api_key, region=settings.odds_api_region) as client:
+            events = client.odds(
+                sport_key=settings.odds_api_sport_key, markets="h2h,totals,btts"
+            )
+    except OddsApiError as e:
+        raise HTTPException(status_code=502, detail=f"odds_api_error: {e}") from e
+    event = _find_odds_event(events, fixture, home, away)
+    if event is None:
+        return {"ok": False, "fixture_id": fixture_id, "updated": 0, "reason": "no_event_match"}
+
+    def _pin(market_key: str, selection: str, point: Optional[float] = None) -> Optional[float]:
+        return _best_price(event, market_key, selection, point=point, prefer_pinnacle=True)
+
+    pin_map: Dict[str, Optional[float]] = {
+        "home_win": _pin("h2h", home),
+        "draw": _pin("h2h", "Draw"),
+        "away_win": _pin("h2h", away),
+        "over_2_5": _pin("totals", "Over", 2.5),
+        "under_2_5": _pin("totals", "Under", 2.5),
+        "btts_yes": _pin("btts", "Yes"),
+        "btts_no": _pin("btts", "No"),
+    }
+    updated = 0
+    for row in eng.store.predictions_for_fixture(fixture_id):
+        mt = str(row.get("market_type") or "")
+        d = pin_map.get(mt)
+        if d is None:
+            continue
+        eng.store.set_prediction_closing_line(int(row["id"]), float(d))
+        updated += 1
+    return {
+        "ok": True,
+        "fixture_id": fixture_id,
+        "updated": updated,
+        "snapshot": {k: v for k, v in pin_map.items() if v is not None},
+    }
+
+
 def _norm_name(value: str) -> str:
     return " ".join(value.lower().replace(".", "").split())
 
@@ -1157,6 +1681,48 @@ def _book_prices(
     return out
 
 
+def _best_price(
+    event: Optional[Dict[str, object]],
+    market_key: str,
+    selection: str,
+    *,
+    point: Optional[float] = None,
+    prefer_pinnacle: bool = False,
+) -> Optional[float]:
+    """Best decimal across books for one (market, selection). When
+    `prefer_pinnacle=True` and Pinnacle has a price, return Pinnacle's
+    price even if another book is higher — used to build the de-vig
+    vector from a single sharp book."""
+    prices = _book_prices(event, market_key, selection, point=point)
+    if not prices:
+        return None
+    if prefer_pinnacle:
+        for b, d in prices:
+            if b.lower() == "pinnacle":
+                return d
+    return max(p for _, p in prices)
+
+
+def _devig_vector(
+    event: Optional[Dict[str, object]],
+    market_key: str,
+    selections: Sequence[tuple[str, Optional[float]]],
+    *,
+    prefer_pinnacle: bool = True,
+) -> Optional[List[float]]:
+    """Return decimal odds for every mutually-exclusive selection on a
+    market (in the order given). All selections must resolve to a price
+    for the de-vig calculation to be meaningful — if any is missing we
+    return None and the caller falls back to raw-edge mode."""
+    out: List[float] = []
+    for sel, point in selections:
+        d = _best_price(event, market_key, sel, point=point, prefer_pinnacle=prefer_pinnacle)
+        if d is None or d <= 1.0:
+            return None
+        out.append(d)
+    return out
+
+
 def _outcome_matches(outcome: Dict[str, object], selection: str, point: Optional[float]) -> bool:
     raw = str(outcome.get("name") or "").strip().lower()
     wanted = selection.strip().lower()
@@ -1168,6 +1734,134 @@ def _outcome_matches(outcome: Dict[str, object], selection: str, point: Optional
         return abs(float(outcome.get("point")) - float(point)) < 1e-9
     except (TypeError, ValueError):
         return False
+
+
+# ----------------------------------------------------------------------
+# Resolution loop helpers — used by POST /soccer/fixtures/{id}/resolve.
+# We can only grade markets whose outcome is deterministic from the final
+# (home_goals, away_goals) tuple. Player props, cards, corners, and any
+# stat-level market need a separate stats feed and are skipped here.
+# ----------------------------------------------------------------------
+
+# Market types we know how to grade from just (hg, ag). Keep this list
+# in sync with the canonical market_type strings used by record_prediction
+# and SoccerEngine._CALIBRATE_KEYS.
+_SCORE_DERIVABLE_MARKETS = {
+    "match_result", "home_win", "draw", "away_win",
+    "total_goals", "over_1_5", "under_1_5",
+    "over_2_5", "under_2_5", "over_3_5", "under_3_5",
+    "btts", "btts_yes", "btts_no",
+    "team_total", "correct_score",
+}
+
+
+def _resolve_leg(leg: Dict[str, object], home_goals: int, away_goals: int) -> Optional[int]:
+    """Grade a BetLeg dict from the final score. Returns 1 (hit), 0
+    (miss), or None for markets that need stats we don't have."""
+    kind = str(leg.get("kind") or "").lower()
+    params = leg.get("params") or {}
+    if not isinstance(params, dict):
+        return None
+    total = home_goals + away_goals
+
+    if kind == "match_result":
+        side = str(params.get("side", "")).upper()
+        if home_goals > away_goals:
+            return 1 if side in ("H", "HOME", "1") else 0
+        if home_goals < away_goals:
+            return 1 if side in ("A", "AWAY", "2") else 0
+        return 1 if side in ("D", "DRAW", "X") else 0
+
+    if kind == "total_goals":
+        try:
+            line = float(params.get("line"))
+        except (TypeError, ValueError):
+            return None
+        side = str(params.get("side", "")).lower()
+        # Exact-integer line is a push: books refund the stake. Treat as
+        # void so the calibration layer doesn't learn a spurious miss.
+        if abs(total - line) < 1e-9:
+            return None
+        if side == "over":
+            return 1 if total > line else 0
+        if side == "under":
+            return 1 if total < line else 0
+        return None
+
+    if kind == "btts":
+        side = str(params.get("side", "")).lower()
+        both_scored = home_goals > 0 and away_goals > 0
+        if side in ("yes", "y", "true"):
+            return 1 if both_scored else 0
+        if side in ("no", "n", "false"):
+            return 1 if not both_scored else 0
+        return None
+
+    if kind == "team_total":
+        team = str(params.get("team", "")).lower()
+        try:
+            line = float(params.get("line"))
+        except (TypeError, ValueError):
+            return None
+        side = str(params.get("side", "")).lower()
+        goals = home_goals if team in ("home", "h") else (
+            away_goals if team in ("away", "a") else None
+        )
+        if goals is None:
+            return None
+        if abs(goals - line) < 1e-9:
+            return None  # exact integer line pushes
+        if side == "over":
+            return 1 if goals > line else 0
+        if side == "under":
+            return 1 if goals < line else 0
+        return None
+
+    if kind == "correct_score":
+        try:
+            h = int(params.get("home"))
+            a = int(params.get("away"))
+        except (TypeError, ValueError):
+            return None
+        return 1 if (home_goals == h and away_goals == a) else 0
+
+    # Anything else (anytime_scorer, first_scorer, player_yellow,
+    # total_cards, total_corners, total_shots, ...) needs a stats feed
+    # we don't ingest yet. Caller treats None as "skipped".
+    return None
+
+
+def _grade_market_type_from_score(
+    market_type: str, leg: Dict[str, object], home_goals: int, away_goals: int
+) -> Optional[int]:
+    """Grade a market_type string. The legacy persisted-prediction path
+    stores the canonical market_type (e.g. "over_2_5") rather than the
+    raw leg kind, so we synthesise an equivalent BetLeg dict where
+    needed."""
+    mt = market_type.lower()
+    if mt in ("home_win",):
+        return _resolve_leg({"kind": "match_result", "params": {"side": "H"}}, home_goals, away_goals)
+    if mt in ("draw",):
+        return _resolve_leg({"kind": "match_result", "params": {"side": "D"}}, home_goals, away_goals)
+    if mt in ("away_win",):
+        return _resolve_leg({"kind": "match_result", "params": {"side": "A"}}, home_goals, away_goals)
+    if mt.startswith("over_") or mt.startswith("under_"):
+        # e.g. "over_2_5" -> side=over, line=2.5
+        side, _, line_str = mt.partition("_")
+        try:
+            line = float(line_str.replace("_", "."))
+        except ValueError:
+            return None
+        return _resolve_leg(
+            {"kind": "total_goals", "params": {"line": line, "side": side}},
+            home_goals, away_goals,
+        )
+    if mt == "btts_yes":
+        return _resolve_leg({"kind": "btts", "params": {"side": "yes"}}, home_goals, away_goals)
+    if mt == "btts_no":
+        return _resolve_leg({"kind": "btts", "params": {"side": "no"}}, home_goals, away_goals)
+    # Fall back to grading the stored leg directly.
+    return _resolve_leg(leg, home_goals, away_goals)
 
 
 def _parlay_blueprints(
@@ -1316,8 +2010,23 @@ def _betslips_for_fixture(
     away = eng.team_names.get(away_id, away_id)
     match_label = f"{home} vs {away}"
     probs = eng.score_model.outcome_probs(home_id, away_id, neutral=neutral, max_goals=10)
+    probs = eng.calibrate_probs(probs)
     event = _find_odds_event(events, fixture, home, away)
     slips: List[SoccerBetslipOut] = []
+
+    # Build the de-vig vector for each market once, so every selection
+    # within a market shares the same no-vig consensus probability.
+    h2h_market = [(home, None), ("Draw", None), (away, None)]
+    totals_market = [("Over", 2.5), ("Under", 2.5)]
+    h2h_vec = _devig_vector(event, "h2h", h2h_market) if event else None
+    totals_vec = _devig_vector(event, "totals", totals_market) if event else None
+    market_vectors = {
+        ("h2h", home, None): h2h_vec,
+        ("h2h", "Draw", None): h2h_vec,
+        ("h2h", away, None): h2h_vec,
+        ("totals", "Over", 2.5): totals_vec,
+        ("totals", "Under", 2.5): totals_vec,
+    }
 
     specs = [
         ("match_result", {"side": "H"}, "h2h", home, f"{home} win", probs["home_win"], None),
@@ -1331,21 +2040,41 @@ def _betslips_for_fixture(
         if not prices:
             continue
         best_book, best_decimal = max(prices, key=lambda x: x[1])
+        market_vec = market_vectors.get((market_key, selection, point))
         rep = report_edge(
             float(p_model),
             best_decimal,
             min_edge=min_edge,
             kelly_fraction=settings.soccer_kelly_fraction,
             kelly_cap=settings.soccer_kelly_cap,
+            market_decimal_odds=market_vec,
         )
         if rep.edge is None or rep.edge < min_edge or rep.kelly_fraction <= 0:
+            continue
+        # When we have a de-vig vector, demand the model also beats the
+        # no-vig market consensus by min_edge. Beating only the raw best
+        # book price is largely just consuming the book's vig and is the
+        # #1 trap retail bettors fall into.
+        if rep.edge_vs_market is not None and rep.edge_vs_market < min_edge:
             continue
         confidence, warnings = _single_confidence(
             p_model=float(p_model),
             edge=float(rep.edge),
             book_count=len(prices),
+            edge_vs_market=rep.edge_vs_market,
         )
         stake = round(bankroll * rep.kelly_fraction * confidence, 2)
+        reasons = [
+            f"Model {float(p_model) * 100:.1f}% vs raw market {100 / best_decimal:.1f}%.",
+            f"Best live price {best_decimal:.2f} at {best_book}; fair price {rep.fair_decimal_odds:.2f}.",
+            f"Kelly suggests {rep.kelly_fraction * 100:.2f}% bankroll before confidence haircut.",
+        ]
+        if rep.no_vig_market_prob is not None:
+            reasons.insert(
+                1,
+                f"De-vig market consensus {rep.no_vig_market_prob * 100:.1f}% "
+                f"(edge vs consensus {rep.edge_vs_market * 100:+.2f}%).",
+            )
         slips.append(SoccerBetslipOut(
             slip_id=f"{fixture['id']}:{kind}:{selection}:{point or ''}",
             fixture_id=str(fixture["id"]),
@@ -1374,11 +2103,7 @@ def _betslips_for_fixture(
             risk_level="safer" if float(p_model) >= 0.35 and rep.edge >= 0.08 else "moderate",
             risk_flags=warnings,
             confidence=confidence,
-            reasons=[
-                f"Model {float(p_model) * 100:.1f}% vs market {100 / best_decimal:.1f}%.",
-                f"Best live price {best_decimal:.2f} at {best_book}; fair price {rep.fair_decimal_odds:.2f}.",
-                f"Kelly suggests {rep.kelly_fraction * 100:.2f}% bankroll before confidence haircut.",
-            ],
+            reasons=reasons,
             warnings=warnings,
         ))
 
@@ -1408,17 +2133,17 @@ def _betslips_for_fixture(
         if bp.risk_level not in {"safer", "moderate"} or bp.fair_probability < 0.14:
             continue
         min_price = bp.fair_decimal_odds * (1.0 + max(min_edge, 0.05))
-        stake_fraction = min(settings.soccer_kelly_cap * 0.50, 0.006)
-        if bp.risk_level == "moderate":
-            stake_fraction *= 0.55
-        stake = round(bankroll * stake_fraction, 2)
+        # SGP / model parlays carry NO confirmed book price (books quote
+        # SGPs with their own correlation adjustment that we don't know).
+        # Per P0-5 review: surface as SCOUT only — zero stake until the
+        # user pastes a real SGP price into the bet builder and re-prices.
         slips.append(SoccerBetslipOut(
             slip_id=f"{fixture['id']}:parlay:{abs(hash(bp.label))}",
             fixture_id=str(fixture["id"]),
             match_label=match_label,
             kickoff_unix=int(fixture["kickoff_unix"]),
             slip_type="model_parlay",
-            title=bp.label,
+            title=f"SCOUT · {bp.label}",
             legs=[
                 SoccerBetslipLegOut(kind=l.kind, label=l.label or l.kind, params=dict(l.params))
                 for l in bp.legs
@@ -1428,21 +2153,23 @@ def _betslips_for_fixture(
             book_decimal_odds=None,
             minimum_acceptable_decimal=round(min_price, 3),
             edge=None,
-            kelly_fraction=stake_fraction,
-            stake_usd=stake,
+            kelly_fraction=0.0,
+            stake_usd=0.0,
             safety_score=bp.safety_score,
-            risk_level=bp.risk_level,
+            risk_level="scout",
             risk_flags=bp.risk_flags,
-            confidence=max(0.35, min(0.85, bp.safety_score / 100.0 - 0.08)),
+            confidence=max(0.35, min(0.75, bp.safety_score / 100.0 - 0.15)),
             reasons=[
-                "Generated from joint Monte Carlo, not independent-leg multiplication.",
+                "Generated from joint Monte Carlo (correct correlation), not independent-leg multiplication.",
                 f"Only bet if sportsbook offers at least {min_price:.2f} combined odds.",
                 f"Correlation factor {bp.correlation_factor:.2f}; fair probability {bp.fair_probability * 100:.1f}%.",
+                "SCOUT: SGP price not auto-fetched — paste into bet builder before staking.",
             ],
             warnings=[
-                "Same-game parlay book quote must be checked manually.",
+                "Books apply their own SGP correlation rebate; their quoted price will be lower than the leg product.",
                 *bp.risk_flags,
             ],
+            scout_only=True,
         ))
     return slips
 
@@ -1581,17 +2308,16 @@ def _build_stat_single(
         return None
     fair = 1.0 / p_model
     min_price = fair * (1.0 + max(min_edge, 0.05))
-    # Stat markets generally settle close to the line, so we cap stake to
-    # well under 1% bankroll until we have closing-line proof of edge.
-    stake_fraction = min(settings.soccer_kelly_cap * 0.35, 0.004)
-    if p_model < 0.55:
-        stake_fraction *= 0.75
-    stake = round(bankroll * stake_fraction, 2)
+    # No confirmed book quote for these markets on the Odds API free tier.
+    # Per pro-bettor review (P0-5): publish as SCOUT only — zero stake,
+    # so the user must paste in a real price and re-price via the bet
+    # builder before risking capital.
     safety = max(0.0, min(100.0, 50 + (p_model - 0.5) * 100))
-    risk_level = "moderate" if p_model >= 0.55 else "high"
-    risk_flags: List[str] = ["Model-only price; The Odds API free tier does not return this market."]
-    if p_model < 0.55:
-        risk_flags.append("thin empirical probability")
+    risk_level = "scout"
+    risk_flags: List[str] = [
+        "SCOUT — no confirmed sportsbook quote; the auto-tuned line maximises hit-rate, not edge.",
+        "Paste the real book price into the bet builder before staking.",
+    ]
     slug = f"{kind}:{params.get('team','total')}:{params.get('side','')}:{params.get('line','')}"
     return SoccerBetslipOut(
         slip_id=f"{fixture['id']}:{slug}",
@@ -1599,7 +2325,7 @@ def _build_stat_single(
         match_label=match_label,
         kickoff_unix=int(fixture["kickoff_unix"]),
         slip_type="model_single",
-        title=label,
+        title=f"SCOUT · {label}",
         legs=[SoccerBetslipLegOut(
             kind=kind,
             label=label,
@@ -1612,22 +2338,29 @@ def _build_stat_single(
         book_decimal_odds=None,
         minimum_acceptable_decimal=round(min_price, 3),
         edge=None,
-        kelly_fraction=stake_fraction,
-        stake_usd=stake,
+        kelly_fraction=0.0,
+        stake_usd=0.0,
         safety_score=safety,
         risk_level=risk_level,
         risk_flags=risk_flags,
-        confidence=max(0.30, min(0.70, p_model - 0.05)),
+        confidence=max(0.30, min(0.65, p_model - 0.10)),
         reasons=[
             f"Joint Monte Carlo gives {p_model * 100:.1f}% — fair price {fair:.2f}.",
             f"Only bet if the sportsbook quotes at least {min_price:.2f}.",
-            "Line auto-tuned from simulator distribution to avoid near-certain or noisy edges.",
+            "Auto-tuned line maximises hit-rate, not edge — confirm a real book quote before betting.",
         ],
         warnings=risk_flags,
+        scout_only=True,
     )
 
 
-def _single_confidence(*, p_model: float, edge: float, book_count: int) -> tuple[float, List[str]]:
+def _single_confidence(
+    *,
+    p_model: float,
+    edge: float,
+    book_count: int,
+    edge_vs_market: Optional[float] = None,
+) -> tuple[float, List[str]]:
     confidence = 0.72
     warnings: List[str] = []
     if edge >= 0.15:
@@ -1644,6 +2377,14 @@ def _single_confidence(*, p_model: float, edge: float, book_count: int) -> tuple
     if book_count < 3:
         confidence -= 0.10
         warnings.append("thin book coverage")
+    if edge_vs_market is None:
+        warnings.append("no de-vig consensus available (single-book market)")
+        confidence -= 0.05
+    elif edge_vs_market < 0.04:
+        warnings.append("edge vs de-vig consensus is thin")
+        confidence -= 0.05
+    elif edge_vs_market > 0.10:
+        confidence += 0.05
     return max(0.25, min(0.90, confidence)), warnings
 
 

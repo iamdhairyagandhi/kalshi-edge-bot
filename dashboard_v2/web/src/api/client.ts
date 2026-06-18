@@ -276,6 +276,8 @@ export type SoccerMarketEdge = {
   recommendation: string;
   book_count: number;
   prices: SoccerBookPrice[];
+  no_vig_market_prob: number | null;
+  edge_vs_market: number | null;
 };
 
 export type SoccerParlayBlueprint = {
@@ -333,6 +335,7 @@ export type SoccerBetslip = {
   confidence: number;
   reasons: string[];
   warnings: string[];
+  scout_only: boolean;
 };
 
 export type SoccerBetslipBatch = {
@@ -349,6 +352,16 @@ export type SoccerCalibrationRow = {
   n_resolved: number;
   brier: number;
   reliability: { bin_lo: number; bin_hi: number; n: number; predicted: number; observed: number }[];
+};
+
+export type SoccerResolveResult = {
+  fixture_id: string;
+  home_goals: number;
+  away_goals: number;
+  predictions_graded: number;
+  bet_builder_graded: number;
+  skipped_unsupported_market: number;
+  calibration_records: number;
 };
 
 async function getJSON<T>(path: string): Promise<T> {
@@ -398,6 +411,22 @@ export const api = {
                 teams: number;
                 decay_per_day: number;
               }>("/api/soccer/fit-statsbomb", body || {}),
+  soccerFitXg: (body?: {
+                competitions?: { competition_id: number; season_id: number; neutral?: boolean }[];
+                decay_per_day?: number;
+                match_limit_per_comp?: number;
+              }) => postJSON<{
+                ok: boolean;
+                fit_source: string;
+                competitions: string[];
+                matches_used: number;
+                matches_with_xg: number;
+                xg_shots_trained: number;
+                xg_goals_trained: number;
+                xg_backend: string;
+                xg_base_rate: number;
+                decay_per_day: number;
+              }>("/api/soccer/fit-xg", body || {}),
   soccerIngestOddsFixtures: () => postJSON<{
                 ok: boolean;
                 sport_key: string;
@@ -433,6 +462,33 @@ export const api = {
               return getJSON<SoccerBetslipBatch>(`/api/soccer/betslips?${qs.toString()}`);
             },
   soccerCalibration: () => getJSON<SoccerCalibrationRow[]>("/api/soccer/calibration"),
+  soccerResolveFixture: (fixtureId: string, payload: { home_goals: number; away_goals: number }) =>
+              postJSON<SoccerResolveResult>(
+                `/api/soccer/fixtures/${encodeURIComponent(fixtureId)}/resolve`,
+                payload,
+              ),
+  soccerSnapshotClosingLine: (fixtureId: string) =>
+              postJSON<{
+                ok: boolean; fixture_id: string; updated: number;
+                snapshot?: Record<string, number>; reason?: string;
+              }>(
+                `/api/soccer/fixtures/${encodeURIComponent(fixtureId)}/snapshot-closing-line`,
+                {},
+              ),
+  soccerRecordPrediction: (payload: {
+                fixture_id: string;
+                market_type: string;
+                leg: Record<string, unknown>;
+                fair_probability: number;
+                fair_decimal_odds: number;
+                book_decimal_odds?: number;
+                pinnacle_close_decimal?: number;
+                edge?: number;
+                kelly_fraction?: number;
+                recommendation?: string;
+              }) => postJSON<{ ok: boolean; prediction_id: number }>(
+                "/api/soccer/predictions", payload,
+              ),
 };
 
 /* ----- WebSocket with auto-reconnect ----- */
